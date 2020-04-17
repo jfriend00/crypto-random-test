@@ -356,6 +356,7 @@ async function analyze() {
                 await processFile(bucket.filename);
             }
         }
+        log.now("No conflicting ids found.")
     } finally {
         log.flush();
     }
