@@ -53,6 +53,11 @@ function getLogger(delay = 1000, skipInitial = true) {
         let now = Date.now();
         if (now - lastOutputTime > delay) {
             console.log(...args);
+            if (pendingTimer) {
+                clearTimeout(pendingTimer);
+                pendingTimer = null;
+                pendingOutput = null;
+            }
             lastOutputTime = now;
         } else {
             // we did send some logging recently, so queue this
