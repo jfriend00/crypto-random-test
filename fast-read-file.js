@@ -2,13 +2,19 @@
 
 const fsp = require('fs').promises;
 
-async function fastReadFile(filename, buffer = null) {
+
+// Note, if you pass in a buffer, expect that the buffer may not
+// be the exact same size as the file is.
+// Use the bytesRead return value to know how many bytes in the buffer to pay attention to
+// The bufferExtra argument tells fastReadFile to allocate extra space in the buffer if you are
+// reusing the same buffer and don't want to be resizing it by small amounts each time
+async function fastReadFile(filename, buffer = null, bufferExtra = 0) {
     let handle = await fsp.open(filename, "r");
     let bytesRead;
     try {
         let stats = await handle.stat();
         if (!buffer || buffer.length < stats.size) {
-            buffer = Buffer.allocUnsafe(stats.size);
+            buffer = Buffer.allocUnsafe(stats.size + bufferExtra);
         }
         // clear any extra part of the buffer so there's no data leakage
         // from a previous file via the shared buffer
@@ -23,6 +29,7 @@ async function fastReadFile(filename, buffer = null) {
             throw new Error("bytesRead not full file size")
         }
     } finally {
+        // note this does not await the file close
         handle.close().catch(err => {
             console.log(err);
         });
@@ -30,8 +37,8 @@ async function fastReadFile(filename, buffer = null) {
     return {buffer, bytesRead};
 }
 
-async function fastReadFileLines(filename, buf = null) {
-    const {bytesRead, buffer} = await fastReadFile(filename, buf);
+async function fastReadFileLines(filename, buf = null, bufferExtra = 0) {
+    const {bytesRead, buffer} = await fastReadFile(filename, buf, bufferExtra);
 
     let index = 0, targetIndex;
     let lines = [];
