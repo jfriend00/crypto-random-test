@@ -1,0 +1,12 @@
+// <Buffer 02 3d ab 4f 48 cb 79 f9 1c 7e 21 97 e7 b1 a0 55>
+
+// create base58 encoder that uses only alpha numerics and leaves out O and 0 which get confused
+const base58 = require('base-x')('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz');
+
+//const testData = Buffer.from([0x02, 0x3d, 0xab, 0x4f, 0x48, 0xcb, 0x79, 0xf9, 0x1c, 0x7e, 0x21, 0x97, 0xe7, 0xb1, 0xa0, 0x55]);
+const testData = Buffer.from([0x02, 0x3d, 0xab, 0x4f, 0x48, 0xcb, 0x79, 0xf9, 0x1c, 0x7e, 0x21, 0x97, 0xe7, 0xb1, 0xa0, 0x55]);
+
+let str = base58.encode(testData);
+console.log(str);
+let result = base58.decode(str);
+console.log(result);
