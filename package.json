@@ -15,5 +15,8 @@
   "bugs": {
     "url": "https://github.com/jfriend00/crypto-random-test/issues"
   },
-  "homepage": "https://github.com/jfriend00/crypto-random-test#readme"
+  "homepage": "https://github.com/jfriend00/crypto-random-test#readme",
+  "dependencies": {
+    "base-x": "^3.0.8"
+  }
 }
