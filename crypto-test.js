@@ -316,11 +316,17 @@ async function analyze() {
             let set = new Set();
 
             let startT = process.hrtime.bigint();
-            let buffer = null;
-            let result = await fastReadFileLines(file, buffer);
+            let result = await fastReadFileLines(file, buffer, 50 * 1024);
             let data = result.lines;
 
             // keep reusing buffer which may have been made larger since last time
+            /*
+            if (!buffer) {
+                log.now(`new buffer allocated, size ${result.buffer.length}`);
+            } else if (buffer !== result.buffer) {
+                log.now(`new buffer allocated, size increased from ${buffer.length} to ${result.buffer.length}`)
+            }
+            */
             buffer = result.buffer;
 
             //let data = (await fsp.readFile(file, "utf8")).split("\n");
