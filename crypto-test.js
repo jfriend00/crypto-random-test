@@ -1,5 +1,6 @@
+'use strict';
+
 const crypto = require('crypto');
-const readline = require('readline');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -72,7 +73,6 @@ function getLogger(delay = 1000, skipInitial = true) {
                 }, now - lastOutputTime + delay);
             }
         }
-
     }
 
     // clear any pending output
@@ -82,7 +82,6 @@ function getLogger(delay = 1000, skipInitial = true) {
             pendingTimer = null;
         }
         if (pendingOutput) {
-
             console.log(...pendingOutput);
             pendingOutput = null;
         }
@@ -373,8 +372,8 @@ async function makeRandoms() {
         // how often to out
         const progressMultiple = 100_000;
 
-        for (let i = 0; i < numToTry; i++) {
-            if (i !== 0 && i % progressMultiple === 0) {
+        for (let i = 1; i <= numToTry; i++) {
+            if (i % progressMultiple === 0) {
                 log(`Generating #${addCommas(i)}`);
             }
             // original author's code (which lost random characters)
@@ -405,6 +404,7 @@ async function makeRandoms() {
             await collection.delete();
         }
     } finally {
+        // make sure any pending logs get sent
         log.flush();
     }
 }

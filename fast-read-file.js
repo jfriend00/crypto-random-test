@@ -1,3 +1,5 @@
+'use strict';
+
 const fsp = require('fs').promises;
 
 async function fastReadFile(filename, buffer = null) {
@@ -17,7 +19,7 @@ async function fastReadFile(filename, buffer = null) {
         bytesRead = ret.bytesRead;
         if (bytesRead !== stats.size) {
             // no data leaking out
-            buffer.fill(0);  
+            buffer.fill(0);
             throw new Error("bytesRead not full file size")
         }
     } finally {
@@ -49,7 +51,7 @@ async function fastReadFileLines(filename, buf = null) {
     if (index < bytesRead) {
         lines.push(buffer.toString('utf8', index, bytesRead));
     }
-    
+
     return {buffer, lines};
 }
 
@@ -57,7 +59,7 @@ module.exports = {fastReadFile, fastReadFileLines};
 
 // if called directly from command line, run this test function
 if (require.main === module) {
-    
+
     let buffer = Buffer.alloc(1024 * 1024 * 10, "abc\n", "utf8");
 
     fastReadFileLines("zzzz", buffer).then(result => {
