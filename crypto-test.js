@@ -5,6 +5,9 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const {fastReadFileLines} = require('./fast-read-file.js');
+const makeBucketKey = require('./bucketkey.js');
+const addCommas = require('./addcommas.js');
+const { Worker } = require('worker_threads');
 
 // create base58 encoder that uses only alpha numerics and leaves out O and 0 which get confused
 const base58Encode = require('base-x')('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz').encode;
@@ -13,27 +16,6 @@ function delay(t, v) {
     return new Promise(resolve => {
         setTimeout(resolve, t, v);
     })
-}
-
-function addCommas(str) {
-    var parts = (str + "").split("."),
-        main = parts[0],
-        len = main.length,
-        output = "",
-        i = len - 1;
-
-    while(i >= 0) {
-        output = main.charAt(i) + output;
-        if ((len - i) % 3 === 0 && i > 0) {
-            output = "," + output;
-        }
-        --i;
-    }
-    // put decimal part back
-    if (parts.length > 1) {
-        output += "." + parts[1];
-    }
-    return output;
 }
 
 // logging function to output progress every so often based on timeout
@@ -99,28 +81,12 @@ function getLogger(delay = 1000, skipInitial = true) {
 
 const log = getLogger();
 
-
-// make a unique filename using first few letters of
-// the string.  Strings are case sensitive, bucket filenames
-// cannot be so it has to be case neutralized while retaining
-// uniqueness
-function makeBucketKey(str) {
-    // with base58 algorithm, the first character does not have as much randomness
-    // so we pick the 2nd and 3rd characters for the bucket keys and this makes
-    // much more even buckets
-    let piece = str.substr(1,2);
-    let filename = [];
-    // double up each character, but
-    for (let ch of piece) {
-        filename.push(ch);
-        if (ch >= 'a' && ch <= 'z') {
-            filename.push("_");
-        } else {
-            filename.push(ch);
-        }
+function DEBUG(flag, ...args) {
+    if (process.env[flag]) {
+        log.now(...args);
     }
-    return filename.join("").toLowerCase();
 }
+
 
 // this value times the number of total buckets has to fit in memory
 const bucketCacheMax = 3000;
@@ -131,6 +97,9 @@ class Bucket {
         this.filename = filename;
         this.cnt = 0;
         this.writeToDisk = writeToDisk;
+        // promise to wait for before writing to the file
+        this.waitPromise = Promise.resolve();
+        this.flushCnt = 0;
 
         // We dither the bucketCacheMax so that buckets aren't all trying to write at the same time
         // After they write once (and are thus spread out in time), then they will reset to full cache size
@@ -155,17 +124,19 @@ class Bucket {
     // write any cached items to disk
     async flush() {
         if (this.writeToDisk && this.items.length)  {
-            let data = this.items.join("\n") + "\n";
+            this.items.push("");                // this will give us a trailing \n which we want
+            let data = this.items.join("\n");
             this.items.length = 0;
-            if (this.flushPending) {
-                throw new Error("Can't call flush() when flush is already in progress");
+            if (this.flushCnt > 0) {
+                DEBUG("DEBUG_F3", `flushCnt ${this.flushCnt}, ${this.filename}`);
+                throw new Error("flush operations waiting");
+            }
+            if (this.flushCnt > 3) {
+                throw new Error("Exceeded 3 flush operations waiting");
             }
 
             function flushNow() {
-                this.flushPending = true;
-                return fsp.appendFile(this.filename, data).finally(() => {
-                    this.flushPending = false;
-                });
+                return fsp.appendFile(this.filename, data);
             }
 
             // we write to disk with retry because we once go EBUSY (perhaps from a backup program)
@@ -193,9 +164,16 @@ class Bucket {
                 });
             }
 
-            return flushRetry.call(this);
+            ++this.flushCnt;
+            this.waitPromise = this.waitPromise.then(() => {
+                flushRetry.call(this).finally(() => {
+                    --this.flushCnt;
+                });
+            });
+            return this.waitPromise;
         }
         this.items.length = 0;
+        return this.waitPromise;
     }
 
     delete() {
@@ -224,7 +202,11 @@ class BucketCollection {
     }
     async flush() {
         // this could perhaps be sped up by doing 4 at a time instead of serially
-        for (let bucket of this.buckets.values()) {
+
+        // because of multi-tasking issues, we get a static list of buckets to flush
+        // before we await any of them
+        let buckets = Array.from(this.buckets.values());
+        for (let bucket of buckets) {
             await bucket.flush();
         }
     }
@@ -253,15 +235,37 @@ let writeToDisk = true;
 let cleanupBucketFiles = true;
 let skipAnalyze = false;
 let analyzeOnly = false;
+let numWorkers = 0;
+let numToBatch = 1000;
 
-// -noDisk        don't write to disk
-// -noCleanup     erase bucket files when done
-// -analyzeOnly   analyze files in bucket directory only
-// -skipAnalyze   skip the analysis, just generate the bucket files
+function checkNum(val) {
+    val = +val;
+    if (typeof val !== "number" || val <= 0) {
+        console.log('Invalid argument, expecting number. Must be arg=nnn such as worker=5')
+        process.exit(1);
+    }
+    return val;
+}
+
+// -noDisk          don't write to disk
+// -noCleanup       erase bucket files when done
+// -analyzeOnly     analyze files in bucket directory only
+// -skipAnalyze     skip the analysis, just generate the bucket files
+// -workers=nnn     use this many workers for key generation
+// -numToBatch=nnn  how many in a batch to send back from worker to main thread
 if (process.argv.length > 2) {
     let args = process.argv.slice(2);
     for (let arg of args) {
         arg = arg.toLowerCase();
+
+        // see if we have a parameter like "key=val"
+        let val = 0;
+        let index = arg.indexOf("=");
+        if (index > 0) {
+            let pieces = arg.split("=");
+            arg = pieces[0];                // put first part in arg
+            val = pieces[1];               // keep value here
+        }
         switch(arg) {
             case "-nodisk":
                 writeToDisk = false;
@@ -274,6 +278,13 @@ if (process.argv.length > 2) {
                 break;
             case "-analyzeonly":
                 analyzeOnly = true;
+                break;
+            case "-workers":
+                // convert val to number (if possible)
+                numWorkers = checkNum(val);
+                break;
+            case "-numtobatch":
+                numToBatch = checkNum(val);
                 break;
             default:
                 if (/[^\d,]/.test(arg)) {
@@ -367,39 +378,166 @@ async function analyze() {
     }
 }
 
-async function makeRandoms() {
+const progressMultiple = 100_000;
+
+async function generateRandoms() {
+    let start = Date.now();
+
+    let g1Total = 0n;
+    let g2Total = 0n;
+
+    for (let i = 1; i <= numToTry; i++) {
+        if (i % progressMultiple === 0) {
+            log(`Generating #${addCommas(i)}`);
+        }
+        // original author's code (which lost random characters)
+        // const string = crypto.randomBytes(16).toString('base64') + '' + Date.now();
+        // const orderId = Buffer.from(idSeed).toString('base64').replace(/[\/\+\=]/g, '');
+
+        // my first edit to keep all random characters by replacing with chars allowed in a filename
+        // const idSeed = crypto.randomBytes(16).toString('base64') + '' + Date.now();
+        // const orderId = idSeed.toString('base64').replace(/=/g, '').replace(/\+/g, "-").replace(/\//g, "~");
+
+        // new base58 encoding algorithm, also drops the Date.now() as it just isn't needed
+        let t1 = process.hrtime.bigint();
+        const orderId = base58Encode(crypto.randomBytes(16));
+        const bucketKey = makeBucketKey(orderId);
+        let t2 = process.hrtime.bigint();
+        await collection.add(bucketKey, orderId);
+        let t3 = process.hrtime.bigint();
+        g1Total += (t2 - t1);
+        g2Total += (t3 - t2);
+    }
+
+    // set DEBUG_F1 flag in environment for key and bucket generation time
+    DEBUG("DEBUG_F1", `keyGeneration = ${addCommas(g1Total)}, bucketGeneration = ${addCommas(g2Total)}`);
+
+    log.now(`Total buckets: ${collection.size}, Max bucket size: ${collection.getMaxBucketSize()}`);
+    await collection.flush();
+
+    let delta = Date.now() - start;
+    log.now(`Run time for creating buckets: ${addCommas(delta)}ms, ${addCommas((delta / numToTry) * 1000)}ms per thousand`);
+}
+
+async function generateRandomsWorkers() {
+    return new Promise((resolve, reject) => {
+        let workers = new Set();
+        let keysReceived = 0;
+        let randomsRemaining = numToTry;
+        let randomsPerWorker = Math.ceil(numToTry / numWorkers);
+        let randomsProcessed = 0;
+
+        let t1 = process.hrtime.bigint();
+        let bucketProcessTime = 0n;
+
+        const keysToProcess = [];
+        let processingNow = false;
+        let maxKeysToProcess = 0;
+
+        // We serialize the adding of keys here because we were
+        // getting re-entrant problems while buckets were awaiting flush
+        // and new worker messages arrived and were being processed
+        // This way we serialize all the adding to buckets
+        async function processKeys() {
+            // if already in this loop, ignore this call
+            if (processingNow || keysToProcess.length === 0) {
+                DEBUG("DEBUG_F2", `processKeys() re-entrancy blocked`);
+                return;
+            }
+            processingNow = true;
+            let t2 = process.hrtime.bigint();
+            // note that during the await in this loop, new keys may be adding to keysToProcess
+            while (keysToProcess.length) {
+                if (keysToProcess.length > maxKeysToProcess) {
+                    maxKeysToProcess = keysToProcess.length;
+                    DEBUG("DEBUG_F2", `maxKeysToProcess increased to ${maxKeysToProcess}`);
+                }
+                // we use .pop() instead of .shift() because it seems like it's probably
+                // more efficient to take one off the end rather than the beginning
+                // and it does not matter if we process keys in FIFO order
+                const [bucketKey, orderId] = keysToProcess.pop();
+                await collection.add(bucketKey, orderId);
+                ++randomsProcessed;
+                if (randomsProcessed % progressMultiple === 0) {
+                    log(`Generating #${addCommas(randomsProcessed)}`);
+                }
+            }
+            if (randomsProcessed === numToTry) {
+                let t2 = process.hrtime.bigint();
+                await collection.flush();
+                let t3 = process.hrtime.bigint();
+                bucketProcessTime += (t3 - t2);
+                DEBUG("DEBUG_F1", `totalGeneration = ${addCommas(t3 - t1)}, bucketInsertion = ${addCommas(bucketProcessTime)}`);
+                resolve();
+                return;
+            }
+            let t3 = process.hrtime.bigint();
+            bucketProcessTime += (t3 - t2);
+            processingNow = false;
+        }
+
+        for (let i = 0; i < numWorkers; i++) {
+            let num = Math.min(randomsRemaining, randomsPerWorker);
+            let worker = new Worker("./worker.js", {
+                workerData: {numToTry: num, numToBatch: numToBatch, workerId: i}
+            });
+            workers.add(worker);
+            randomsRemaining -= num;
+
+            worker.on('message', async (msg) => {
+
+                // Design note: these message handlers can be called
+                // while other parts of this file are paused at an await
+                if (msg.event === "batch") {
+                    let data = msg.data;
+                    keysReceived += data.length;
+                    //console.log(`Incoming ${data.length} keys from WorkerId ${msg.workerId}, total keysReceived = ${keysReceived}`);
+                    //console.log(data);
+                    let t2 = process.hrtime.bigint();
+                    // add these new keys to the list of keys to be processed
+                    // we're pushing them one at a time to try to avoid a copy of the data
+                    for (let item of data) {
+                        keysToProcess.push(item);
+                    }
+                    let t3 = process.hrtime.bigint();
+                    bucketProcessTime += (t3 - t2);
+
+                    // kick of processing if it's not already going
+                    processKeys();
+                }
+
+            });
+
+            worker.on('exit', code => {
+                console.log(`worker ${i} exited`);
+                workers.delete(worker);
+                if (workers.size === 0) {
+                    log.now("Last worker done");
+                }
+            });
+
+            worker.on('error', err => {
+                console.log(`worker ${i} had error`, err);
+                reject(err);
+            });
+        }
+    });
+}
+
+async function runIt() {
+    let start = Date.now();
+
     try {
-        let start = Date.now();
 
         if (analyzeOnly) {
             return analyze();
         }
 
-        // how often to out
-        const progressMultiple = 100_000;
-
-        for (let i = 1; i <= numToTry; i++) {
-            if (i % progressMultiple === 0) {
-                log(`Generating #${addCommas(i)}`);
-            }
-            // original author's code (which lost random characters)
-            // const string = crypto.randomBytes(16).toString('base64') + '' + Date.now();
-            // const orderId = Buffer.from(idSeed).toString('base64').replace(/[\/\+\=]/g, '');
-
-            // my first edit to keep all random characters by replacing with chars allowed in a filename
-            // const idSeed = crypto.randomBytes(16).toString('base64') + '' + Date.now();
-            // const orderId = idSeed.toString('base64').replace(/=/g, '').replace(/\+/g, "-").replace(/\//g, "~");
-
-            // new base58 encoding algorithm, also drops the Date.now() as it just isn't needed
-            const orderId = base58Encode(crypto.randomBytes(16));
-            const bucketKey = makeBucketKey(orderId);
-            await collection.add(bucketKey, orderId);
+        if (!numWorkers) {
+            await generateRandoms();
+        } else {
+            await generateRandomsWorkers();
         }
-        log.now(`Total buckets: ${collection.size}, Max bucket size: ${collection.getMaxBucketSize()}`);
-        await collection.flush();
-
-        let delta = Date.now() - start;
-        log.now(`Run time for creating buckets: ${addCommas(delta)}ms, ${addCommas((delta / numToTry) * 1000)}ms per thousand`);
 
         if (!skipAnalyze) {
             log.now("Analyzing buckets...")
@@ -413,6 +551,10 @@ async function makeRandoms() {
         // make sure any pending logs get sent
         log.flush();
     }
+
+    log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`)
 }
 
-makeRandoms();
+runIt().catch(err => {
+    log.now(err);
+});
