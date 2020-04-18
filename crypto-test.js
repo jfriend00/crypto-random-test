@@ -76,6 +76,12 @@ function getLogger(delay = 1000, skipInitial = true) {
         console.log(...args);
     }
 
+    fn.debug = function(flag, ...args) {
+        if (process.env[flag]) {
+            fn(...args);
+        }
+    }
+
     return fn;
 }
 
@@ -91,6 +97,8 @@ function DEBUG(flag, ...args) {
 // this value times the number of total buckets has to fit in memory
 const bucketCacheMax = 3000;
 
+const bucketTransactions = [];
+
 class Bucket {
     constructor(filename, writeToDisk = true) {
         this.items = [];
@@ -101,16 +109,40 @@ class Bucket {
         this.waitPromise = Promise.resolve();
         this.flushCnt = 0;
 
+        // DEBUG code
+        this.transactions = [];
+
         // We dither the bucketCacheMax so that buckets aren't all trying to write at the same time
         // After they write once (and are thus spread out in time), then they will reset to full cache size
-        let dither = Math.floor(Math.random() * bucketCacheMax) + 10;
+        let dither = Math.floor(Math.random() * bucketCacheMax);
         if (Math.random() > 0.5) {
             dither = -dither;
         }
-        this.bucketCacheMax = bucketCacheMax + dither;
+        this.bucketCacheMax = Math.max(bucketCacheMax + dither, 10);
     }
+
+    // DEBUG code
+    record(msg) {
+        /*
+        this.transactions.push(msg);
+        if (this.transactions.length > 100) {
+            this.transactions.shift();    // remove older item
+        }*/
+    }
+
     // add an item to cache, flush to disk if necessary
-    async add(item) {
+    // This is a funky function.  Because of event loop scheduling issues, (contention with workers firing new keys at us)
+    // we don't want to always return a promise.
+    // So, instead, we return either true or a promise and the caller must check and await only if it's a promise
+    // This allows all the cached add() calls to be processed entirely synchronously and only the ones that have
+    // to call flush will be processed with a promise and await
+    add(item) {
+        this.record(`Add item ${item}, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+        if (this.flushCnt > 0) {
+            DEBUG("DEBUG_F3", `flushCnt on add() ${this.flushCnt}, ${this.filename}`);
+            console.log(this.transactions);
+            throw new Error("add() called before flush() finished")
+        }
         ++this.cnt;
         this.items.push(item);
         if (this.items.length > this.bucketCacheMax) {
@@ -118,65 +150,104 @@ class Bucket {
             // to spread out the writes.  After that, we want a full cache size
             let priorBucketCacheMax = this.bucketCacheMax;
             this.bucketCacheMax = bucketCacheMax;
-            await this.flush();
+            return this.flush();
         }
+        return true;
     }
     // write any cached items to disk
     async flush() {
+
+        this.record(`flush() starting, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+        //DEBUG("DEBUG_F3", `flush() ${this.flushCnt}, ${this.filename}`);
+
         if (this.writeToDisk && this.items.length)  {
             this.items.push("");                // this will give us a trailing \n which we want
             let data = this.items.join("\n");
             this.items.length = 0;
             if (this.flushCnt > 0) {
                 DEBUG("DEBUG_F3", `flushCnt ${this.flushCnt}, ${this.filename}`);
+                console.log(this.transactions);
+                process.exit(1);
                 throw new Error("flush operations waiting");
             }
-            if (this.flushCnt > 3) {
-                throw new Error("Exceeded 3 flush operations waiting");
-            }
 
-            function flushNow() {
-                return fsp.appendFile(this.filename, data);
-            }
+            // for debugging purposes, multiple strategies for writing to the file
+            const strategy = "asyncRetry";
 
-            // we write to disk with retry because we once go EBUSY (perhaps from a backup program)
-
-            let retryCntr = 0;
-            const retryMax = 10;
-            const retryDelay = 200;
-            const retryBackoff = 200;
-            let lastErr;
-
-            function flushRetry() {
-                if (retryCntr > retryMax) {
-                    throw lastErr;
-                }
-                return flushNow.call(this).catch(err => {
-                    // On a few runs, we got EBUSY errors when flushing
-                    // My guess is that this was a backup program contending for access
-                    // So, I implemented a backoff retry algorithm to make sure we don't lose
-                    // data in the middle of a multi-hour run
-                    lastErr = err;
-                    log.now("flushNow error, retrying...", err);
-                    return delay(retryDelay + (retryCntr++ * retryBackoff)).then(() => {
-                        return flushRetry.call(this);
-                    });
-                });
-            }
-
-            ++this.flushCnt;
-            this.waitPromise = this.waitPromise.then(() => {
-                flushRetry.call(this).finally(() => {
+            if (strategy === "async") {
+                ++this.flushCnt;
+                return fsp.appendFile(this.filename, data).finally(() => {
+                    this.record(`flush() ending, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
                     --this.flushCnt;
                 });
-            });
-            return this.waitPromise;
+
+            } else if (strategy === "sync") {
+                ++this.flushCnt;
+                try {
+                    fs.appendFileSync(this.filename, data);
+                    this.record(`flush() ending, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
+                } finally {
+                    --this.flushCnt;
+                }
+
+            } else if (strategy === "asyncRetry") {
+                if (this.flushCnt > 0) {
+                    DEBUG("DEBUG_F3", `flushCnt ${this.flushCnt}, ${this.filename}`);
+                    console.log(this.transactions);
+                    process.exit(1);
+                    throw new Error("flush operations waiting");
+                }
+                if (this.flushCnt > 3) {
+                    throw new Error("Exceeded 3 flush operations waiting");
+                }
+
+                function flushNow() {
+                    return fsp.appendFile(this.filename, data);
+                }
+
+                // we write to disk with retry because we once go EBUSY (perhaps from a backup program)
+
+                let retryCntr = 0;
+                const retryMax = 10;
+                const retryDelay = 200;
+                const retryBackoff = 200;
+                let lastErr;
+
+                function flushRetry() {
+                    if (retryCntr > retryMax) {
+                        throw lastErr;
+                    }
+                    return flushNow.call(this).catch(err => {
+                        // On a few runs, we got EBUSY errors when flushing
+                        // My guess is that this was a backup program contending for access
+                        // So, I implemented a backoff retry algorithm to make sure we don't lose
+                        // data in the middle of a multi-hour run
+                        lastErr = err;
+                        log.now("flushNow error, retrying...", err);
+                        return delay(retryDelay + (retryCntr++ * retryBackoff)).then(() => {
+                            return flushRetry.call(this);
+                        });
+                    });
+                }
+
+                ++this.flushCnt;
+                this.waitPromise = this.waitPromise.then(() => {
+                    return flushRetry.call(this).finally(() => {
+                        --this.flushCnt;
+                        this.record(`flush() done, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+                    });
+                });
+                return this.waitPromise;
+            }
+        } else {
+            this.record(`flush() ending (empty), flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
         }
         this.items.length = 0;
         return this.waitPromise;
     }
 
     delete() {
+        this.record("delete");
         return fsp.unlink(this.filename);
     }
 
@@ -191,6 +262,8 @@ class BucketCollection {
         this.buckets = new Map();
         this.dir = dir;
     }
+    // note: This returns what bucket.add() returns which will be either true or a promise
+    // depending upon whether the bucket had to be flushed
     add(key, data) {
         let bucket = this.buckets.get(key);
         if (!bucket) {
@@ -236,7 +309,7 @@ let cleanupBucketFiles = true;
 let skipAnalyze = false;
 let analyzeOnly = false;
 let numWorkers = 0;
-let numToBatch = 1000;
+let numToBatch = 2000;
 
 function checkNum(val) {
     val = +val;
@@ -403,7 +476,12 @@ async function generateRandoms() {
         const orderId = base58Encode(crypto.randomBytes(16));
         const bucketKey = makeBucketKey(orderId);
         let t2 = process.hrtime.bigint();
-        await collection.add(bucketKey, orderId);
+        // collection.add() can return either a promise or behaves synchronously and returns true
+        let ret = collection.add(bucketKey, orderId);
+        // if this returns a promise, await it, otherwise it was synchronous
+        if (typeof ret.then === "function") {
+            await ret;
+        }
         let t3 = process.hrtime.bigint();
         g1Total += (t2 - t1);
         g2Total += (t3 - t2);
@@ -431,8 +509,9 @@ async function generateRandomsWorkers() {
         let bucketProcessTime = 0n;
 
         const keysToProcess = [];
-        let processingNow = false;
+        let processingNow = 0;
         let maxKeysToProcess = 0;
+        let pausedWorkers = [];
 
         // We serialize the adding of keys here because we were
         // getting re-entrant problems while buckets were awaiting flush
@@ -441,22 +520,30 @@ async function generateRandomsWorkers() {
         async function processKeys() {
             // if already in this loop, ignore this call
             if (processingNow || keysToProcess.length === 0) {
-                DEBUG("DEBUG_F2", `processKeys() re-entrancy blocked`);
+                // DEBUG("DEBUG_F2", `processKeys() re-entrancy blocked`);
+                if (keysToProcess.length > maxKeysToProcess) {
+                    maxKeysToProcess = keysToProcess.length;
+                    log.debug("DEBUG_F2", `2: maxKeysToProcess increased to ${maxKeysToProcess}, processingNow=${processingNow}`);
+                }
                 return;
             }
-            processingNow = true;
+            ++processingNow;
             let t2 = process.hrtime.bigint();
             // note that during the await in this loop, new keys may be adding to keysToProcess
             while (keysToProcess.length) {
                 if (keysToProcess.length > maxKeysToProcess) {
                     maxKeysToProcess = keysToProcess.length;
-                    DEBUG("DEBUG_F2", `maxKeysToProcess increased to ${maxKeysToProcess}`);
+                    log.debug("DEBUG_F2", `1: maxKeysToProcess increased to ${maxKeysToProcess}`);
                 }
                 // we use .pop() instead of .shift() because it seems like it's probably
                 // more efficient to take one off the end rather than the beginning
                 // and it does not matter if we process keys in FIFO order
                 const [bucketKey, orderId] = keysToProcess.pop();
-                await collection.add(bucketKey, orderId);
+                let ret = collection.add(bucketKey, orderId);
+                // if this returns a promise, await it, otherwise it was synchronous
+                if (typeof ret.then === "function") {
+                    await ret;
+                }
                 ++randomsProcessed;
                 if (randomsProcessed % progressMultiple === 0) {
                     log(`Generating #${addCommas(randomsProcessed)}`);
@@ -473,7 +560,13 @@ async function generateRandomsWorkers() {
             }
             let t3 = process.hrtime.bigint();
             bucketProcessTime += (t3 - t2);
-            processingNow = false;
+
+            // we emptied our queue so tell all the paused workers, we're ready for more
+            for (let worker of pausedWorkers) {
+                worker.postMessage({event: "batch"});
+            }
+            pausedWorkers.length = 0;
+            --processingNow;
         }
 
         for (let i = 0; i < numWorkers; i++) {
@@ -489,6 +582,9 @@ async function generateRandomsWorkers() {
                 // Design note: these message handlers can be called
                 // while other parts of this file are paused at an await
                 if (msg.event === "batch") {
+                    // keep track of the fact that this worker is now paused, waiting for the next batch message
+                    pausedWorkers.push(worker);
+
                     let data = msg.data;
                     keysReceived += data.length;
                     //console.log(`Incoming ${data.length} keys from WorkerId ${msg.workerId}, total keysReceived = ${keysReceived}`);
@@ -503,7 +599,10 @@ async function generateRandomsWorkers() {
                     bucketProcessTime += (t3 - t2);
 
                     // kick of processing if it's not already going
-                    processKeys();
+                    processKeys().catch(err => {
+                        log.now(err);
+                        process.exit(1);
+                    });
                 }
 
             });
@@ -520,6 +619,9 @@ async function generateRandomsWorkers() {
                 console.log(`worker ${i} had error`, err);
                 reject(err);
             });
+
+            // start the worker processing
+            worker.postMessage({event: "batch"});
         }
     });
 }
