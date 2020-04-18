@@ -541,6 +541,7 @@ async function generateRandomsWorkers() {
                 const [bucketKey, orderId] = keysToProcess.pop();
                 let ret = collection.add(bucketKey, orderId);
                 // if this returns a promise, await it, otherwise it was synchronous
+                // for a run of 100,000,000, not awaiting when we don't have to is 30% faster
                 if (typeof ret.then === "function") {
                     await ret;
                 }
