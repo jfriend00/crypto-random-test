@@ -523,7 +523,7 @@ async function generateRandomsWorkers() {
                 // DEBUG("DEBUG_F2", `processKeys() re-entrancy blocked`);
                 if (keysToProcess.length > maxKeysToProcess) {
                     maxKeysToProcess = keysToProcess.length;
-                    log.debug("DEBUG_F2", `2: maxKeysToProcess increased to ${maxKeysToProcess}, processingNow=${processingNow}`);
+                    DEBUG("DEBUG_F2", `2: maxKeysToProcess increased to ${maxKeysToProcess}`);
                 }
                 return;
             }
@@ -533,7 +533,7 @@ async function generateRandomsWorkers() {
             while (keysToProcess.length) {
                 if (keysToProcess.length > maxKeysToProcess) {
                     maxKeysToProcess = keysToProcess.length;
-                    log.debug("DEBUG_F2", `1: maxKeysToProcess increased to ${maxKeysToProcess}`);
+                    DEBUG("DEBUG_F2", `1: maxKeysToProcess increased to ${maxKeysToProcess}`);
                 }
                 // we use .pop() instead of .shift() because it seems like it's probably
                 // more efficient to take one off the end rather than the beginning
