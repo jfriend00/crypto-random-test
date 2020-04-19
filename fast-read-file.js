@@ -8,8 +8,15 @@ const fsp = require('fs').promises;
 // Use the bytesRead return value to know how many bytes in the buffer to pay attention to
 // The bufferExtra argument tells fastReadFile to allocate extra space in the buffer if you are
 // reusing the same buffer and don't want to be resizing it by small amounts each time
-async function fastReadFile(filename, buffer = null, bufferExtra = 0) {
-    let handle = await fsp.open(filename, "r");
+// file argument can be filename or open file handle
+async function fastReadFile(file, buffer = null, bufferExtra = 0) {
+    // see if we were passed a filename or a filehandle
+    let handle;
+    if (typeof file === "string") {
+        handle = await fsp.open(file, "r");
+    } else {
+        handle = file;
+    }
     let bytesRead;
     try {
         let stats = await handle.stat();
@@ -29,16 +36,20 @@ async function fastReadFile(filename, buffer = null, bufferExtra = 0) {
             throw new Error("bytesRead not full file size")
         }
     } finally {
-        // note this does not await the file close
-        handle.close().catch(err => {
-            console.log(err);
-        });
+        // if we opened the file, then close it
+        if (typeof file === "string") {
+            // note this does not await the file close
+            handle.close().catch(err => {
+                console.log(err);
+            });
+        }
     }
     return {buffer, bytesRead};
 }
 
-async function fastReadFileLines(filename, buf = null, bufferExtra = 0) {
-    const {bytesRead, buffer} = await fastReadFile(filename, buf, bufferExtra);
+// file argument can be filename or file handle
+async function fastReadFileLines(file, buf = null, bufferExtra = 0) {
+    const {bytesRead, buffer} = await fastReadFile(file, buf, bufferExtra);
 
     let index = 0, targetIndex;
     let lines = [];
