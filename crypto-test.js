@@ -95,7 +95,7 @@ function DEBUG(flag, ...args) {
 
 
 // this value times the number of total buckets has to fit in memory
-const bucketCacheMax = 3000;
+const bucketCacheMax = 5000;
 
 const bucketTransactions = [];
 
@@ -297,17 +297,26 @@ class Bucket {
 }
 
 class BucketCollection {
-    constructor(dir, writeToDisk = true) {
+    constructor(dirs, writeToDisk = true) {
         // map key is bucketID, value is bucket object for that key
         this.buckets = new Map();
-        this.dir = dir;
+        this.dirs = dirs;
+        this.dirIndex = 0;
     }
+
+    getNextDir() {
+        if (this.dirIndex >= this.dirs.length) {
+            this.dirIndex = 0;
+        }
+        return this.dirs[this.dirIndex++];
+    }
+
     // note: This returns what bucket.add() returns which will be either true or a promise
     // depending upon whether the bucket had to be flushed
     add(key, data) {
         let bucket = this.buckets.get(key);
         if (!bucket) {
-            let filename = path.join(this.dir, key);
+            let filename = path.join(this.getNextDir(), key);
             bucket = new Bucket(filename, writeToDisk);
             this.buckets.set(key, bucket);
         }
@@ -350,6 +359,9 @@ let skipAnalyze = false;
 let analyzeOnly = false;
 let numWorkers = 0;
 let numToBatch = 2000;
+let analyzeNum = 4;
+let dirs = [];
+let collection;
 
 function checkNum(val) {
     val = +val;
@@ -366,19 +378,21 @@ function checkNum(val) {
 // -skipAnalyze     skip the analysis, just generate the bucket files
 // -workers=nnn     use this many workers for key generation
 // -numToBatch=nnn  how many in a batch to send back from worker to main thread
+// -dirs="path1;path2;path3"
 if (process.argv.length > 2) {
     let args = process.argv.slice(2);
-    for (let arg of args) {
-        arg = arg.toLowerCase();
-
+    for (let i = 0; i < args.length; i++) {
+        let arg = args[i];
         // see if we have a parameter like "key=val"
         let val = 0;
         let index = arg.indexOf("=");
         if (index > 0) {
+            // -xxx=SomeName
             let pieces = arg.split("=");
-            arg = pieces[0];                // put first part in arg
-            val = pieces[1];               // keep value here
+            arg = pieces[0];             // -xxx
+            val = pieces[1];             // SomeName, preserve case in the = part for case sensitive directory names
         }
+        arg = arg.toLowerCase();
         switch(arg) {
             case "-nodisk":
                 writeToDisk = false;
@@ -399,6 +413,28 @@ if (process.argv.length > 2) {
             case "-numtobatch":
                 numToBatch = checkNum(val);
                 break;
+            case "-analyzenum":
+                analyzeNum = checkNum(val);
+                break;
+            case "-dirs":
+                if (!val) {
+                    let val = args[i+1];                // look ahead to next argument
+                    i++;                                // skip next argument in for loop above
+                }
+                dirs = val.split(";");
+                let lastDir;
+                try {
+                    for (let [j, dir] of dirs.entries()) {
+                        lastDir = dir;
+                        dir = path.resolve(__dirname, dir);
+                        fs.accessSync(dir);
+                        dirs[j] = dir;
+                    }
+                } catch(e) {
+                    console.log(`Invalid argument on ${lastDir}, expecting dirs="path1;path2;path3"`);
+                    processs.exit(1);
+                }
+                break;
             default:
                 if (/[^\d,]/.test(arg)) {
                     console.log(`Unknown argument ${arg}`);
@@ -410,9 +446,7 @@ if (process.argv.length > 2) {
     }
 }
 
-let bucketDir = path.join(__dirname, "buckets");
 
-let collection = new BucketCollection(bucketDir, writeToDisk);
 
 log.now(`Running ${addCommas(numToTry)} random ids`);
 
@@ -421,15 +455,28 @@ async function analyze() {
         let cntr = 0;
         const cntrProgress = 10;
         const cntrProgressN = 10n;
-        let buffer = null;
+        let buffers = [];
         let times = [];
+
+        function getBuffer() {
+            if (buffers.length) {
+                return buffers.pop();
+            } else {
+                return null;
+            }
+        }
+
+        function putBuffer(buf) {
+            buffers.push(buf);
+        }
 
         async function processFile(file) {
             if (cntr !== 0 && cntr % cntrProgress === 0) {
-                let sum = 0n;
+/*                let sum = 0n;
                 for (let i = 0; i < cntrProgress; i++) {
                     sum += times[i];
                 }
+*/
                 // log(`Checking bucket #${cntr}, Average readFileTime = ${sum / cntrProgressN}`);
                 // log(`Checking bucket #${cntr}`);
                 log(`Checking bucket #${cntr}`);
@@ -440,7 +487,7 @@ async function analyze() {
             let set = new Set();
 
             let startT = process.hrtime.bigint();
-            let result = await fastReadFileLines(file, buffer, 50 * 1024);
+            let result = await fastReadFileLines(file, getBuffer(), 50 * 1024);
             let data = result.lines;
 
             // keep reusing buffer which may have been made larger since last time
@@ -451,7 +498,6 @@ async function analyze() {
                 log.now(`new buffer allocated, size increased from ${buffer.length} to ${result.buffer.length}`)
             }
             */
-            buffer = result.buffer;
 
             //let data = (await fsp.readFile(file, "utf8")).split("\n");
             let afterReadFileT = process.hrtime.bigint();
@@ -472,23 +518,62 @@ async function analyze() {
             let divisor = 1000n;
             let readFileTime = (afterReadFileT - startT) / divisor;
             times.push(readFileTime);
+
+            // put buffer back into circulation now that we're done with it
+            putBuffer(result.buffer);
         }
 
         if (analyzeOnly) {
-            let files = await fsp.readdir(bucketDir);
-            for (let file of files) {
-                let fullPath = path.join(bucketDir, file)
-                await processFile(fullPath);
-            }
-        } else {
-            for (let bucket of collection.buckets.values()) {
-                if (bucket.fileHandle) {
-                    await processFile(bucket.fileHandle);
-                    await bucket.close();
-                } else {
-                    await processFile(bucket.filename);
+            let files = [];
+            for (let dir of dirs) {
+                let items = await fsp.readdir(dir);
+                for (let filename of items) {
+                    let fullPath = path.join(dir, filename);
+                    files.push(fullPath);
                 }
             }
+            // FIXME: need to randomize the array so we spread out access across multiple disks
+            // FIXME: need to implement concurrent processFile() logic as with actual buckets
+            for (let file of files) {
+                await processFile(file);
+            }
+        } else {
+            const buckets = Array.from(collection.buckets.values());
+            let index = 0;
+            let inFlightCntr = 0;
+            let completionCntr = 0;
+
+            // returns promise when this bucket is done
+            function run() {
+                return new Promise((resolve, reject) => {
+
+                    function runNext() {
+                        if (index < buckets.length) {
+                            const bucket = buckets[index++];
+                            let file = bucket.fileHandle ? bucket.fileHandle : bucket.filename;
+                            ++inFlightCntr;
+                            return processFile(file).catch(reject).finally(() => {
+                                --inFlightCntr;
+                                ++completionCntr;
+                                if (bucket.fileHandle) {
+                                    return bucket.close();
+                                }
+                            }).then(runNext);
+                        } else {
+                            if (completionCntr === buckets.length) {
+                                resolve();
+                            }
+                        }
+                    }
+
+                    while (inFlightCntr < analyzeNum) {
+                        runNext();
+                    }
+
+                });
+            }
+
+            await run();
         }
         log.now("No conflicting ids found.")
     } finally {
@@ -672,7 +757,26 @@ async function generateRandomsWorkers() {
     });
 }
 
+async function preflight() {
+    if (dirs.length === 0) {
+        dirs.push(__dirname);
+    }
+    for (let [i, dir] of dirs.entries()) {
+        let d = path.join(dir, "buckets");
+        dirs[i] = d;
+        try {
+            fs.mkdirSync(d);
+        } catch(e) {
+            if (e.code !== 'EEXIST') {
+                throw e;
+            }
+        }
+    }
+    collection = new BucketCollection(dirs, writeToDisk);
+}
+
 async function runIt() {
+    await preflight();
     let start = Date.now();
 
     try {
