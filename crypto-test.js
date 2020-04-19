@@ -109,6 +109,10 @@ class Bucket {
         this.waitPromise = Promise.resolve();
         this.flushCnt = 0;
 
+        // file handle stuff
+        this.fileHandle = null;
+        this.filePos = 0;
+
         // DEBUG code
         this.transactions = [];
 
@@ -118,6 +122,7 @@ class Bucket {
         if (Math.random() > 0.5) {
             dither = -dither;
         }
+        // cache starts out at least 10 long
         this.bucketCacheMax = Math.max(bucketCacheMax + dither, 10);
     }
 
@@ -171,10 +176,35 @@ class Bucket {
                 throw new Error("flush operations waiting");
             }
 
-            // for debugging purposes, multiple strategies for writing to the file
-            const strategy = "asyncRetry";
+            // for debugging and performance test purposes,
+            //   multiple strategies for writing to the file
+            const strategy = "asyncHandle";
 
-            if (strategy === "async") {
+            if (strategy === "asyncHandle") {
+                // keep file handle open
+                try {
+                    ++this.flushCnt;
+                    if (!this.fileHandle) {
+                        // create new file, open for reading and writing, truncate if exists
+                        this.fileHandle = await fsp.open(this.filename, "w+");
+                    }
+                    const { bytesWritten } = await this.fileHandle.write(data, this.filePos);
+                    if (bytesWritten !== data.length) {
+                        throw new Error(`All data not written to file ${this.filename}, specified ${data.length}, only ${bytesWritten} bytes written`);
+                    }
+                    this.filePos += data.length;
+                } catch(e) {
+                    if (this.fileHandle) {
+                        await this.close().catch(err => {
+                            log.now(err);
+                        });
+                    }
+                    throw e;
+                } finally {
+                    --this.flushCnt;
+                }
+
+            } else if (strategy === "async") {
                 ++this.flushCnt;
                 return fsp.appendFile(this.filename, data).finally(() => {
                     this.record(`flush() ending, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
@@ -242,8 +272,18 @@ class Bucket {
         } else {
             this.record(`flush() ending (empty), flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
         }
-        this.items.length = 0;
+        this.items.ength = 0;
         return this.waitPromise;
+    }
+
+    close() {
+        if (this.fileHandle) {
+            let fh = this.fileHandle;
+            this.fileHandle = null;
+            return fh.close();
+        } else {
+            return Promise.resolve();
+        }
     }
 
     delete() {
@@ -442,7 +482,12 @@ async function analyze() {
             }
         } else {
             for (let bucket of collection.buckets.values()) {
-                await processFile(bucket.filename);
+                if (bucket.fileHandle) {
+                    await processFile(bucket.fileHandle);
+                    await bucket.close();
+                } else {
+                    await processFile(bucket.filename);
+                }
             }
         }
         log.now("No conflicting ids found.")
