@@ -538,6 +538,7 @@ async function analyze() {
                 await processFile(file);
             }
         } else {
+            // get a static array of bucketes so it's easier to asynchronously iterate
             const buckets = Array.from(collection.buckets.values());
             let index = 0;
             let inFlightCntr = 0;
@@ -560,22 +561,23 @@ async function analyze() {
                                 }
                             }).then(runNext);
                         } else {
+                            // see if all the files are done or there are still more waiting to finish
                             if (completionCntr === buckets.length) {
                                 resolve();
                             }
                         }
                     }
 
-                    while (inFlightCntr < analyzeNum) {
+                    // start up the desired number of loops
+                    for (let i = 0; i < analyzeNum; i++) {
                         runNext();
                     }
-
                 });
             }
 
             await run();
         }
-        log.now("No conflicting ids found.")
+        log.now("---------------------------------\nNo conflicting ids found!\n")
     } finally {
         log.flush();
     }
