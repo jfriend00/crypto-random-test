@@ -2,6 +2,7 @@
 
 const fsp = require('fs').promises;
 
+// TODO: Add support for ERR_FS_FILE_TOO_LARGE when buffer can't be made large enough
 
 // Note, if you pass in a buffer, expect that the buffer may not
 // be the exact same size as the file is.
@@ -9,6 +10,8 @@ const fsp = require('fs').promises;
 // The bufferExtra argument tells fastReadFile to allocate extra space in the buffer if you are
 // reusing the same buffer and don't want to be resizing it by small amounts each time
 // file argument can be filename or open file handle
+
+// Returns {buffer, bytesRead}
 async function fastReadFile(file, buffer = null, bufferExtra = 0) {
     // see if we were passed a filename or a filehandle
     let handle;
@@ -47,10 +50,7 @@ async function fastReadFile(file, buffer = null, bufferExtra = 0) {
     return {buffer, bytesRead};
 }
 
-// file argument can be filename or file handle
-async function fastReadFileLines(file, buf = null, bufferExtra = 0) {
-    const {bytesRead, buffer} = await fastReadFile(file, buf, bufferExtra);
-
+function parseBufferIntoLines(buffer, bytesRead) {
     let index = 0, targetIndex;
     let lines = [];
     while (index < bytesRead && (targetIndex = buffer.indexOf(10, index)) !== -1) {
@@ -70,10 +70,17 @@ async function fastReadFileLines(file, buf = null, bufferExtra = 0) {
         lines.push(buffer.toString('utf8', index, bytesRead));
     }
 
-    return {buffer, lines};
+    return {buffer, lines, bytesRead};
 }
 
-module.exports = {fastReadFile, fastReadFileLines};
+// file argument can be filename or file handle
+async function fastReadFileLines(file, buf = null, bufferExtra = 0) {
+    const {bytesRead, buffer} = await fastReadFile(file, buf, bufferExtra);
+
+    return parseBufferIntoLines(buffer, bytesRead);
+}
+
+module.exports = {fastReadFile, fastReadFileLines, parseBufferIntoLines};
 
 // if called directly from command line, run this test function
 if (require.main === module) {
