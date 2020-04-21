@@ -24,7 +24,12 @@ async function fastReadFile(file, buffer = null, bufferExtra = 0) {
     try {
         let stats = await handle.stat();
         if (!buffer || buffer.length < stats.size) {
-            buffer = Buffer.allocUnsafe(stats.size + bufferExtra);
+            let sharedArrayBuffer = new SharedArrayBuffer(stats.size + bufferExtra);
+            buffer = Buffer.from(sharedArrayBuffer);
+            // put a property on our buffer that lets us get back to the
+            // parent sharedArrayBuffer for use in passing to worker threads
+            buffer.sharedArrayBuffer = sharedArrayBuffer;
+            // buffer = Buffer.allocUnsafe(stats.size + bufferExtra);
         }
         // clear any extra part of the buffer so there's no data leakage
         // from a previous file via the shared buffer
@@ -85,7 +90,8 @@ module.exports = {fastReadFile, fastReadFileLines, parseBufferIntoLines};
 // if called directly from command line, run this test function
 if (require.main === module) {
 
-    let buffer = Buffer.alloc(1024 * 1024 * 10, "abc\n", "utf8");
+//    let buffer = Buffer.alloc(1024 * 1024 * 10, "abc\n", "utf8");
+    let buffer = null;
 
     fastReadFileLines("zzzz", buffer).then(result => {
         let lines = result.lines;
