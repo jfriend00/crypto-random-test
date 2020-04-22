@@ -67,9 +67,9 @@ class WorkerList {
         this.workers.push(worker);
 
         // if someone is waiting for a worker,
-        // pull the oldest one out of the list and
-        // give it to the old deffered that is waiting
-        if (this.deferredQueue.length) {
+        // pull the oldest worker out of the list and
+        // give it to the oldest deferred that is waiting
+        while (this.deferredQueue.length && this.workers.length) {
             let d = this.deferredQueue.shift();
             d.resolve(this.workers.shift());
         }
