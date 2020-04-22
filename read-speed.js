@@ -11,11 +11,14 @@ const { Worker } = require('worker_threads');
 
 const log = getLogger();
 
+// command line arguments
 const spec = [
     "-numToRead=num", 0,
     "-numConcurrent=num", 4,
-    "-numWorkers=num", 4,
-    "-skipParsing", false
+    "-numWorkers=num", 5,
+    "-skipParsing", false,
+    "-preOpenFiles", false,
+    "-dir=dir", "./buckets",
 ];
 
 // module level configuration variables from command line arguments (with defaults)
@@ -24,6 +27,8 @@ let {
     numConcurrent,
     numWorkers,
     skipParsing,
+    preOpenFiles,
+    dir: sourceDir,
 } = processArgs(spec);
 
 class Bench {
@@ -85,12 +90,23 @@ class WorkerList {
 
 async function run() {
     log.now("Collecting files...")
-    const dir = "./buckets";
-    let files = (await fsp.readdir(dir, {withFileTypes: true}))
-      .filter(entry => entry.isFile())
-      .map(entry => {
-          return path.resolve(path.join(dir, entry.name));
-    });
+    console.log(sourceDir);
+    let files = (await fsp.readdir(sourceDir, {withFileTypes: true}))
+        .filter(entry => entry.isFile());
+    if (numToRead !== 0) {
+        files.length = numToRead;
+    }
+    files = await Promise.all(files.map(entry => {
+        let filename = path.resolve(path.join(sourceDir, entry.name));
+        if (preOpenFiles) {
+          return fsp.open(filename, "r").then(handle => {
+              handle.filename = filename;
+              return handle;
+          });
+        } else {
+          return filename;
+        }
+    }));
     let start = Date.now();
     let totalBytes = 0;
 
@@ -231,7 +247,8 @@ async function run() {
         buffers.push(buffer);
         totalBytes += bytesRead;
         ++numRead;
-        log(`(${numRead} of ${files.length})   ${path.basename(file)}    ${calcRate()} MB/s`);
+        let filename = file.filename ? file.filename : file;
+        log(`(${numRead} of ${files.length})   ${path.basename(filename)}    ${calcRate()} MB/s`);
     });
 
     let delta = Date.now() - start;
@@ -248,9 +265,18 @@ async function run() {
     log.now(`  totalWait:        ${addCommas((Number(totalWait) / (1000 * 1000)).toFixed(0))} ms`);
     log.now("\n");
 //    log.now(`  parseFileTime:    ${parseBench.formatSec(3)}`);
+
+    // close any open files
+    if (typeof files[0] !== "string") {
+        for (let file of files) {
+            await file.close();
+        }
+    }
+
     process.exit(0);
 }
 
 run().catch(err => {
     console.log(err);
+    process.exit(1);
 });
