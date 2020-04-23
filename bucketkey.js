@@ -5,6 +5,29 @@ const mid = chars.charAt(chars.length / 2);
 const doubleBuckets = false;
 const reduceBuckets = true;
 
+const zeroPad = "00000000000000";
+const targetLen = 4;
+
+// Use the first two bytes of a buffer to generate a bucket string value
+// that can be used for a unique filename string
+function makeBucketKeyBinary(buffer) {
+    // we want around 1600 buckets
+    // first byte gets us 256
+    // 1600/256 = 6.25
+    // so we need some extra bits to get up to 1600 buckets
+    // 9 bits =  512
+    // 10 bits = 1024
+    // 11 bits = 2048
+    // So our choice is somewhat between 10 and 11 bits
+    // Currently implemented for 11 bits
+    let byte1 = buffer[0];                           // first 8 bits
+    let byte2 = buffer[1] & 0b00000111;              // next 3 bits, shifted into low position
+    let bucketNum = byte1 + (256 * byte2);
+    let bucketStr = "" + bucketNum;
+    // normalize the length with leading zero padding
+    return zeroPad.slice(0, targetLen - bucketStr.length) + bucketStr;
+}
+
 
 // make a unique filename using first few letters of
 // the string.  Strings are case sensitive, bucket filenames
@@ -68,9 +91,14 @@ function makeBucketKeySmall(str) {
     return filename.join("").toLowerCase();
 }
 
-
-if (reduceBuckets) {
-    module.exports = makeBucketKeySmall;
-} else {
-    module.exports = makeBucketKey;
+module.exports = function makeBucketKeyGeneric(data) {
+    if (typeof data === "string") {
+        if (reduceBuckets) {
+            return makeBucketKeySmall(data);
+        } else {
+            return makeBucketKey(data);
+        }
+    } else {
+        return makeBucketKeyBinary(data);
+    }
 }

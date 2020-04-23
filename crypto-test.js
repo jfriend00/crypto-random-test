@@ -32,15 +32,21 @@ function DEBUG(flag, ...args) {
 
 // this value times the number of total buckets has to fit in memory
 const bucketCacheMax = 5000;
-
 const bucketTransactions = [];
 
 class Bucket {
-    constructor(filename, writeToDisk = true) {
+    constructor(filename, writeToDisk = true, binary = false) {
         this.items = [];
+
+        this.binary = binary;
+        if (binary) {
+            this.buffer = Buffer.allocUnsafe(bucketCacheMax * 16);
+            this.bufferPos = 0;
+        }
         this.filename = filename;
         this.cnt = 0;
         this.writeToDisk = writeToDisk;
+
         // promise to wait for before writing to the file
         this.waitPromise = Promise.resolve();
         this.flushCnt = 0;
@@ -77,21 +83,32 @@ class Bucket {
     // So, instead, we return either true or a promise and the caller must check and await only if it's a promise
     // This allows all the cached add() calls to be processed entirely synchronously and only the ones that have
     // to call flush will be processed with a promise and await
+    // item may be string or buffer (binary)
     add(item) {
-        this.record(`Add item ${item}, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+        //  this.record(`Add item ${item}, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
         if (this.flushCnt > 0) {
             DEBUG("DEBUG_F3", `flushCnt on add() ${this.flushCnt}, ${this.filename}`);
             console.log(this.transactions);
             throw new Error("add() called before flush() finished")
         }
         ++this.cnt;
-        this.items.push(item);
-        if (this.items.length > this.bucketCacheMax) {
-            // the dithered cache size is only used on the first write
-            // to spread out the writes.  After that, we want a full cache size
-            let priorBucketCacheMax = this.bucketCacheMax;
-            this.bucketCacheMax = bucketCacheMax;
-            return this.flush();
+
+        if (this.binary) {
+            let inputBuffer = item;
+            this.bufferPos += inputBuffer.copy(this.buffer, this.bufferPos);
+            // if the buffer is full, save it
+            if (this.bufferPos > (this.buffer.length - inputBuffer.length)) {
+                return this.flush();
+            }
+        } else {
+            this.items.push(item);
+            if (this.items.length > this.bucketCacheMax) {
+                // the dithered cache size is only used on the first write
+                // to spread out the writes.  After that, we want a full cache size
+                let priorBucketCacheMax = this.bucketCacheMax;
+                this.bucketCacheMax = bucketCacheMax;
+                return this.flush();
+            }
         }
         return true;
     }
@@ -100,6 +117,36 @@ class Bucket {
 
         this.record(`flush() starting, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
         //DEBUG("DEBUG_F3", `flush() ${this.flushCnt}, ${this.filename}`);
+
+        // for binary, we only have the "asyncHandle" strategy
+        if (this.binary) {
+            try {
+                ++this.flushCnt;
+                if (!this.fileHandle) {
+                    // create new file, open for reading and writing, truncate if exists
+                    this.fileHandle = await fsp.open(this.filename, "w+");
+                }
+                // write out the buffer, straight to the file
+                const { bytesWritten } = await this.fileHandle.write(this.buffer, 0, this.bufferPos, this.filePos);
+                if (bytesWritten !== this.bufferPos) {
+                    throw new Error(`All data not written to file ${this.filename}, specified ${this.bufferPos}, only ${bytesWritten} bytes written`);
+                }
+                // advance file position to write
+                this.filePos += this.bufferPos;
+                // reset back to start of our buffer for future add() calls
+                this.bufferPos = 0;
+            } catch(e) {
+                if (this.fileHandle) {
+                    await this.fileHandle.close().catch(err => {
+                        log.now(err);
+                    });
+                }
+                throw e;
+            } finally {
+                --this.flushCnt;
+            }
+            return;
+        }
 
         if (this.writeToDisk && this.items.length)  {
             this.items.push("");                // this will give us a trailing \n which we want
@@ -131,7 +178,7 @@ class Bucket {
                     this.filePos += data.length;
                 } catch(e) {
                     if (this.fileHandle) {
-                        await this.close().catch(err => {
+                        await this.fileHandle.close().catch(err => {
                             log.now(err);
                         });
                     }
@@ -208,7 +255,7 @@ class Bucket {
         } else {
             this.record(`flush() ending (empty), flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`)
         }
-        this.items.ength = 0;
+        this.items.length = 0;
         return this.waitPromise;
     }
 
@@ -233,13 +280,17 @@ class Bucket {
 }
 
 class BucketCollection {
-    constructor(dirs, writeToDisk = true) {
+    constructor(dirs, writeToDisk = true, binary = false) {
         // map key is bucketID, value is bucket object for that key
         this.buckets = new Map();
         this.dirs = dirs;
         this.dirIndex = 0;
+        this.writeToDisk = writeToDisk;
+        this.binary = binary;
     }
 
+    // cycles through a list of directories, alternating among them
+    // in cases where we're involving multiple disks
     getNextDir() {
         if (this.dirIndex >= this.dirs.length) {
             this.dirIndex = 0;
@@ -249,11 +300,12 @@ class BucketCollection {
 
     // note: This returns what bucket.add() returns which will be either true or a promise
     // depending upon whether the bucket had to be flushed
+    // data may be string or binary buffer
     add(key, data) {
         let bucket = this.buckets.get(key);
         if (!bucket) {
             let filename = path.join(this.getNextDir(), key);
-            bucket = new Bucket(filename, writeToDisk);
+            bucket = new Bucket(filename, this.writeToDisk, this.binary);
             this.buckets.set(key, bucket);
         }
         return bucket.add(data);
@@ -293,11 +345,12 @@ let writeToDisk = true;
 let cleanupBucketFiles = true;
 let skipAnalyze = false;
 let analyzeOnly = false;
-let numWorkers = 0;
+let numWorkers = 6;
 let numToBatch = 2000;
 let analyzeNum = 4;
 let dirs = [];
 let collection;
+let doBinary = false;    // store bucket data as binary
 
 function checkNum(val) {
     val = +val;
@@ -330,6 +383,9 @@ if (process.argv.length > 2) {
         }
         arg = arg.toLowerCase();
         switch(arg) {
+            case "-binary":
+                doBinary = true;
+                break;
             case "-nodisk":
                 writeToDisk = false;
                 break;
@@ -602,7 +658,13 @@ async function generateRandomsWorkers() {
                 // more efficient to take one off the end rather than the beginning
                 // and it does not matter if we process keys in FIFO order
                 const [bucketKey, orderId] = keysToProcess.pop();
-                let ret = collection.add(bucketKey, orderId);
+                let ret;
+                if (doBinary) {
+                    // orderId is a UInt8Array, we want it to be a nodejs Buffer object
+                    ret = collection.add(bucketKey, Buffer.from(orderId.buffer));
+                } else {
+                    ret = collection.add(bucketKey, orderId);
+                }
                 // if this returns a promise, await it, otherwise it was synchronous
                 // for a run of 100,000,000, not awaiting when we don't have to is 30% faster
                 if (typeof ret.then === "function") {
@@ -636,7 +698,7 @@ async function generateRandomsWorkers() {
         for (let i = 0; i < numWorkers; i++) {
             let num = Math.min(randomsRemaining, randomsPerWorker);
             let worker = new Worker("./worker.js", {
-                workerData: {numToTry: num, numToBatch: numToBatch, workerId: i}
+                workerData: {numToTry: num, numToBatch: numToBatch, workerId: i, doBinary: doBinary}
             });
             workers.add(worker);
             randomsRemaining -= num;
@@ -650,6 +712,9 @@ async function generateRandomsWorkers() {
                     pausedWorkers.push(worker);
 
                     let data = msg.data;
+                    // data is an array of arrays where the inner arrays are [bucketKey, orderId]
+                    // if doBinary is set, then orderId is a binary buffer, 16 btyes long
+                    //    otherwise, orderId is a base58 encoded string
                     keysReceived += data.length;
                     //console.log(`Incoming ${data.length} keys from WorkerId ${msg.workerId}, total keysReceived = ${keysReceived}`);
                     //console.log(data);
@@ -667,6 +732,12 @@ async function generateRandomsWorkers() {
                         log.now(err);
                         process.exit(1);
                     });
+                } else if (msg.event === "usage") {
+                    let data = msg.data;
+                    log.now(`worker ${msg.workerId} finished`);
+                    log.now(`  busy percentage : ${data.busyPercentage.toFixed(1)}%`);
+                    log.now(`  measureBusy:      ${addCommas(data.measureBusy)} `);
+                    log.now(`  measureTotal:     ${addCommas(data.measureTotal)}`);
                 }
 
             });
@@ -705,7 +776,7 @@ async function preflight() {
             }
         }
     }
-    collection = new BucketCollection(dirs, writeToDisk);
+    collection = new BucketCollection(dirs, writeToDisk, doBinary);
 }
 
 async function runIt() {
