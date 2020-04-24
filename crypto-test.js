@@ -35,7 +35,7 @@ function DEBUG(flag, ...args) {
 
 
 // this value times the number of total buckets has to fit in memory
-const bucketCacheMax = 5000;
+const bucketCacheMax = 5000;        // number of keys to cache before writing to disk
 const bucketTransactions = [];
 
 class Bucket {
@@ -46,6 +46,20 @@ class Bucket {
         if (binary) {
             this.buffer = Buffer.allocUnsafe(bucketCacheMax * keyLen);
             this.bufferPos = 0;
+            // We dither the initial buffer length to try to spread out the disk writes
+            // After they write once then they will reset to full buffer size
+            let dither = Math.floor(Math.random() * this.buffer.length);
+            // usable buffer starts out at least long enough for 10 keys
+            this.bufferUsable = Math.max(dither, 10 * keyLen);
+        } else {
+            // We dither the bucketCacheMax so that buckets aren't all trying to write at the same time
+            // After they write once (and are thus spread out in time), then they will reset to full cache size
+            let dither = Math.floor(Math.random() * bucketCacheMax);
+            if (Math.random() > 0.5) {
+                dither = -dither;
+            }
+            // cache starts out at least 10 long
+            this.bucketCacheMax = Math.max(bucketCacheMax + dither, 10);
         }
         this.filename = filename;
         this.cnt = 0;
@@ -62,14 +76,6 @@ class Bucket {
         // DEBUG code
         this.transactions = [];
 
-        // We dither the bucketCacheMax so that buckets aren't all trying to write at the same time
-        // After they write once (and are thus spread out in time), then they will reset to full cache size
-        let dither = Math.floor(Math.random() * bucketCacheMax);
-        if (Math.random() > 0.5) {
-            dither = -dither;
-        }
-        // cache starts out at least 10 long
-        this.bucketCacheMax = Math.max(bucketCacheMax + dither, 10);
     }
 
     // DEBUG code
@@ -92,8 +98,10 @@ class Bucket {
         ++this.cnt;
 
         // if data won't fit into the buffer, then flush first
-        if (this.bufferPos + len > this.bufferLength) {
+        if (this.bufferPos + len >= this.bufferUsable) {
             return this.flush().then(() => {
+                // reset usable buffer to the full length after first flush
+                this.bufferUsable = this.buffer.length;
                 this.bufferPos += buffer.copy(this.buffer, this.bufferPos, start, start + len);
             });
         } else {
@@ -668,6 +676,8 @@ async function generateRandomsWorkers() {
         let maxKeysToProcess = 0;
         let pausedWorkers = [];
         let bufferPool = new BufferPool(0);
+        const processTotal = new Bench();
+        const processWait = new Bench();
 
         function finish() {
             // we emptied our queue so tell all the paused workers, we're ready for more
@@ -709,6 +719,7 @@ async function generateRandomsWorkers() {
             }
             ++processingNow;
             // keysToProcess is an array of {sharedArrayBuffer, cnt} that came from a workerThread
+            processTotal.markBegin();
             while (keysToProcess.length) {
                 const {sharedArrayBuffer, cnt} = keysToProcess.pop();
                 // put nodejs Buffer wrapper back on it (which just sets things on the prototype)
@@ -721,7 +732,9 @@ async function generateRandomsWorkers() {
                     index += keyLen;
                     // ret is an optional promise (for performance reasons)
                     if (typeof ret.then === "function") {
+                        processWait.markBegin();            // keep track of time waiting for disk writes
                         await ret;
+                        processWait.markEnd();
                     }
                     ++randomsProcessed;
                     if (randomsProcessed % progressMultiple === 0) {
@@ -731,9 +744,17 @@ async function generateRandomsWorkers() {
                 // put the buffer back in the pool so it can be used again
                 bufferPool.add(buffer);
             }
+            processTotal.markEnd();
             if (randomsProcessed === numToTry) {
+                processWait.markBegin();            // keep track of time waiting for disk writes
                 await collection.flush();
+                processWait.markEnd();
                 resolve();
+                log.now(`Processing Complete`);
+                log.now(`  processTotal:  ${processTotal.formatSec(1)}`);
+                log.now(`  processTotal:  ${processTotal.formatMs(3)}`);
+                log.now(`  processWait:   ${processWait.formatMs(3)}`);
+                log.now(`  waiting %:     ${((processWait.nsN / processTotal.nsN) * 100).toFixed(1)}%`);
                 return;
             }
             finish();
@@ -883,7 +904,6 @@ async function runIt() {
     let start = Date.now();
 
     try {
-
         if (analyzeOnly) {
             return analyze();
         }
@@ -898,6 +918,7 @@ async function runIt() {
             log.now("Analyzing buckets...")
             await analyze();
         }
+        log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`);
         if (cleanupBucketFiles) {
             log.now("Cleaning up buckets...");
             await collection.delete();
@@ -907,7 +928,6 @@ async function runIt() {
         log.flush();
     }
 
-    log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`)
 }
 
 runIt().catch(err => {
