@@ -11,6 +11,7 @@ const { Worker } = require('worker_threads');
 const { getLogger } = require('../delay-logger');
 const { Bench } = require('../measure');
 const BufferPool = require('./buffer-pool.js');
+const processArgs = require('../cmd-line-args');
 
 const keyLen = 16;
 
@@ -22,8 +23,6 @@ function delay(t, v) {
         setTimeout(resolve, t, v);
     })
 }
-
-
 
 const log = getLogger();
 
@@ -116,7 +115,6 @@ class Bucket {
     // So, instead, we return either true or a promise and the caller must check and await only if it's a promise
     // This allows all the cached add() calls to be processed entirely synchronously and only the ones that have
     // to call flush will be processed with a promise and await
-    // item may be string or buffer (binary)
     add(item) {
         //  this.record(`Add item ${item}, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
         if (this.flushCnt > 0) {
@@ -126,29 +124,20 @@ class Bucket {
         }
         ++this.cnt;
 
-        if (this.binary) {
-            let inputBuffer = item;
-            this.bufferPos += inputBuffer.copy(this.buffer, this.bufferPos);
-            // if the buffer is full, save it
-            if (this.bufferPos > (this.buffer.length - inputBuffer.length)) {
-                return this.flush();
-            }
-        } else {
-            this.items.push(item);
-            if (this.items.length > this.bucketCacheMax) {
-                // the dithered cache size is only used on the first write
-                // to spread out the writes.  After that, we want a full cache size
-                let priorBucketCacheMax = this.bucketCacheMax;
-                this.bucketCacheMax = bucketCacheMax;
-                return this.flush();
-            }
+        this.items.push(item);
+        if (this.items.length > this.bucketCacheMax) {
+            // the dithered cache size is only used on the first write
+            // to spread out the writes.  After that, we want a full cache size
+            let priorBucketCacheMax = this.bucketCacheMax;
+            this.bucketCacheMax = bucketCacheMax;
+            return this.flush();
         }
         return true;
     }
     // write any cached items to disk
     async flush() {
 
-        this.record(`flush() starting, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+        // this.record(`flush() starting, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
         //DEBUG("DEBUG_F3", `flush() ${this.flushCnt}, ${this.filename}`);
 
         // for binary, we only have the "asyncHandle" strategy
@@ -383,109 +372,62 @@ class BucketCollection {
 
 }
 
-// program options
-let numToTry = 100_000;           // run this many iterations if no number passed on command line
-let writeToDisk = true;
-let cleanupBucketFiles = true;
-let skipAnalyze = false;
-let analyzeOnly = false;
-let numWorkers = 6;
-let numToBatch = 2000;
-let analyzeNum = 4;
-let dirs = [];
+const spec = [
+    "-binary", false,
+    "-generateWorkers=num", 6,
+    "-generateOnly", false,
+    "-analyzeOnly", false,
+    "-dirs=[dir]", [],
+    "-numToBatch=num", 2000,
+    "-preserveFiles", false,
+    "-nodisk", false,
+    "-analyzeParallel", 4
+];
+
+// module level configuration variables from command line arguments (with defaults)
+let {
+    binary: doBinary,
+    generateWorkers,
+    generateOnly,
+    analyzeOnly,
+    preserveFiles,
+    dirs,
+    numToBatch,
+    unnamed,
+    nodisk,
+    analyzeParallel,
+} = processArgs(spec);
+
+let numToTry = 100_000;
 let collection;
-let doBinary = false;    // store bucket data as binary
+let writeToDisk = !nodisk;
 
-function checkNum(val) {
-    val = +val;
-    if (typeof val !== "number" || val <= 0) {
-        console.log('Invalid argument, expecting number. Must be arg=nnn such as worker=5')
+// grab unnamed numeric argument for the numToTry
+if (unnamed.length === 1) {
+    let arg = unnamed[0];
+    if (/[^\d,]/.test(arg)) {
+        console.log(`Unknown argument ${arg}`);
         process.exit(1);
+    } else {
+        numToTry = parseInt(arg.replace(/,/g, ""), 10);
     }
-    return val;
+} else if (unnamed.length > 1) {
+    console.log(`Unknown arguments ${unnamed}`);
 }
 
-// -noDisk          don't write to disk
-// -noCleanup       erase bucket files when done
-// -analyzeOnly     analyze files in bucket directory only
-// -skipAnalyze     skip the analysis, just generate the bucket files
-// -workers=nnn     use this many workers for key generation
-// -numToBatch=nnn  how many in a batch to send back from worker to main thread
-// -dirs="path1;path2;path3"
-if (process.argv.length > 2) {
-    let args = process.argv.slice(2);
-    for (let i = 0; i < args.length; i++) {
-        let arg = args[i];
-        // see if we have a parameter like "key=val"
-        let val = 0;
-        let index = arg.indexOf("=");
-        if (index > 0) {
-            // -xxx=SomeName
-            let pieces = arg.split("=");
-            arg = pieces[0];             // -xxx
-            val = pieces[1];             // SomeName, preserve case in the = part for case sensitive directory names
-        }
-        arg = arg.toLowerCase();
-        switch(arg) {
-            case "-binary":
-                doBinary = true;
-                break;
-            case "-nodisk":
-                writeToDisk = false;
-                break;
-            case "-nocleanup":
-                cleanupBucketFiles = false;
-                break;
-            case "-skipanalyze":
-                skipAnalyze = true;
-                break;
-            case "-analyzeonly":
-                analyzeOnly = true;
-                break;
-            case "-workers":
-                // convert val to number (if possible)
-                numWorkers = checkNum(val);
-                break;
-            case "-numtobatch":
-                numToBatch = checkNum(val);
-                break;
-            case "-analyzenum":
-                analyzeNum = checkNum(val);
-                break;
-            case "-dirs":
-                if (!val) {
-                    let val = args[i+1];                // look ahead to next argument
-                    i++;                                // skip next argument in for loop above
-                }
-                dirs = val.split(";");
-                let lastDir;
-                try {
-                    for (let [j, dir] of dirs.entries()) {
-                        lastDir = dir;
-                        dir = path.resolve(__dirname, dir);
-                        fs.accessSync(dir);
-                        dirs[j] = dir;
-                    }
-                } catch(e) {
-                    console.log(`Invalid argument on ${lastDir}, expecting dirs="path1;path2;path3"`);
-                    processs.exit(1);
-                }
-                break;
-            default:
-                if (/[^\d,]/.test(arg)) {
-                    console.log(`Unknown argument ${arg}`);
-                    process.exit(1);
-                } else {
-                    numToTry = parseInt(arg.replace(/,/g, ""), 10);
-                }
-        }
-    }
+if (!analyzeOnly) {
+    log.now(`Generating ${addCommas(numToTry)} random ids`);
+} else {
+    log.now(`Analyzing pre-generated files`);
 }
+log.now(`  generateWorkers:    ${generateWorkers}`);
+log.now(`  numToBatch:         ${numToBatch}`);
+log.now(`  analyzeParallel:    ${analyzeParallel}`);
+log.now(`  binary:             ${doBinary ? "true": "false"}`);
+log.now(`  preserve files:     ${preserveFiles ? "true" : "false"}`);
+log.now(`\n`);
 
-
-
-log.now(`Running ${addCommas(numToTry)} random ids`);
-
+// this is the older analyze that only knows how to analyze text, not binary
 async function analyze() {
     try {
         let cntr = 0;
@@ -600,7 +542,7 @@ async function analyze() {
                     }
 
                     // start up the desired number of loops
-                    for (let i = 0; i < analyzeNum; i++) {
+                    for (let i = 0; i < analyzeParallel; i++) {
                         runNext();
                     }
                 });
@@ -665,7 +607,7 @@ async function generateRandomsWorkers() {
         let workers = new Set();
         let keysReceived = 0;
         let randomsRemaining = numToTry;
-        let randomsPerWorker = Math.ceil(numToTry / numWorkers);
+        let randomsPerWorker = Math.ceil(numToTry / generateWorkers);
         let randomsProcessed = 0;
 
         let t1 = process.hrtime.bigint();
@@ -800,7 +742,7 @@ async function generateRandomsWorkers() {
             --processingNow;
         }
 
-        for (let i = 0; i < numWorkers; i++) {
+        for (let i = 0; i < generateWorkers; i++) {
             let num = Math.min(randomsRemaining, randomsPerWorker);
             let worker = new Worker("./worker.js", {
                 workerData: {numToTry: num, numToBatch: numToBatch, workerId: i, doBinary: doBinary, keyLen: keyLen}
@@ -908,18 +850,18 @@ async function runIt() {
             return analyze();
         }
 
-        if (!numWorkers) {
+        if (!generateWorkers) {
             await generateRandoms();
         } else {
             await generateRandomsWorkers();
         }
 
-        if (!skipAnalyze) {
+        if (!generateOnly) {
             log.now("Analyzing buckets...")
             await analyze();
         }
         log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`);
-        if (cleanupBucketFiles) {
+        if (!preserveFiles && writeToDisk) {
             log.now("Cleaning up buckets...");
             await collection.delete();
         }
