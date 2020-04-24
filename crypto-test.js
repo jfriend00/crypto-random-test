@@ -5,10 +5,14 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const {fastReadFileLines} = require('./fast-read-file.js');
-const makeBucketKey = require('./bucketkey.js');
+const {makeBucketKey, makeBucketKeyBinary} = require('./bucketkey.js');
 const { addCommas } = require('../str-utils');
 const { Worker } = require('worker_threads');
 const { getLogger } = require('../delay-logger');
+const { Bench } = require('../measure');
+const BufferPool = require('./buffer-pool.js');
+
+const keyLen = 16;
 
 // create base58 encoder that uses only alpha numerics and leaves out O and 0 which get confused
 const base58Encode = require('base-x')('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz').encode;
@@ -40,7 +44,7 @@ class Bucket {
 
         this.binary = binary;
         if (binary) {
-            this.buffer = Buffer.allocUnsafe(bucketCacheMax * 16);
+            this.buffer = Buffer.allocUnsafe(bucketCacheMax * keyLen);
             this.bufferPos = 0;
         }
         this.filename = filename;
@@ -75,6 +79,27 @@ class Bucket {
         if (this.transactions.length > 100) {
             this.transactions.shift();    // remove older item
         }*/
+    }
+
+    // same functon as add(), but takes data from a piece of a buffer
+    addFromBuffer(buffer, start, len) {
+        //  this.record(`Add item ${item}, flushCnt=${this.flushCnt}, bucketCacheMax=${this.bucketCacheMax}`);
+        if (this.flushCnt > 0) {
+            DEBUG("DEBUG_F3", `flushCnt on add() ${this.flushCnt}, ${this.filename}`);
+            console.log(this.transactions);
+            throw new Error("add() called before flush() finished")
+        }
+        ++this.cnt;
+
+        // if data won't fit into the buffer, then flush first
+        if (this.bufferPos + len > this.bufferLength) {
+            return this.flush().then(() => {
+                this.bufferPos += buffer.copy(this.buffer, this.bufferPos, start, start + len);
+            });
+        } else {
+            this.bufferPos += buffer.copy(this.buffer, this.bufferPos, start, start + len);
+        }
+        return true;
     }
 
     // add an item to cache, flush to disk if necessary
@@ -296,6 +321,17 @@ class BucketCollection {
             this.dirIndex = 0;
         }
         return this.dirs[this.dirIndex++];
+    }
+
+    // same as add(), but data comes from a piece of a buffer
+    addFromBuffer(key, buffer, start, len) {
+        let bucket = this.buckets.get(key);
+        if (!bucket) {
+            let filename = path.join(this.getNextDir(), key);
+            bucket = new Bucket(filename, this.writeToDisk, this.binary);
+            this.buckets.set(key, bucket);
+        }
+        return bucket.addFromBuffer(buffer, start, len);
     }
 
     // note: This returns what bucket.add() returns which will be either true or a promise
@@ -583,16 +619,16 @@ async function generateRandoms() {
             log(`Generating #${addCommas(i)}`);
         }
         // original author's code (which lost random characters)
-        // const string = crypto.randomBytes(16).toString('base64') + '' + Date.now();
+        // const string = crypto.randomBytes(keyLen).toString('base64') + '' + Date.now();
         // const orderId = Buffer.from(idSeed).toString('base64').replace(/[\/\+\=]/g, '');
 
         // my first edit to keep all random characters by replacing with chars allowed in a filename
-        // const idSeed = crypto.randomBytes(16).toString('base64') + '' + Date.now();
+        // const idSeed = crypto.randomBytes(keyLen).toString('base64') + '' + Date.now();
         // const orderId = idSeed.toString('base64').replace(/=/g, '').replace(/\+/g, "-").replace(/\//g, "~");
 
         // new base58 encoding algorithm, also drops the Date.now() as it just isn't needed
         let t1 = process.hrtime.bigint();
-        const orderId = base58Encode(crypto.randomBytes(16));
+        const orderId = base58Encode(crypto.randomBytes(keyLen));
         const bucketKey = makeBucketKey(orderId);
         let t2 = process.hrtime.bigint();
         // collection.add() can return either a promise or behaves synchronously and returns true
@@ -631,12 +667,29 @@ async function generateRandomsWorkers() {
         let processingNow = 0;
         let maxKeysToProcess = 0;
         let pausedWorkers = [];
+        let bufferPool = new BufferPool(0);
 
-        // We serialize the adding of keys here because we were
-        // getting re-entrant problems while buckets were awaiting flush
-        // and new worker messages arrived and were being processed
-        // This way we serialize all the adding to buckets
-        async function processKeys() {
+        function finish() {
+            // we emptied our queue so tell all the paused workers, we're ready for more
+            while (pausedWorkers.length) {
+                let worker = pausedWorkers.pop();
+                let msg = {event: "batch", data: {}};
+                if (doBinary) {
+                    // there should always be an available buffer here because
+                    // a worker can't get into the pausedWorkers without putting a buffer into the pool
+                    // send a buffer back to the worker so it can be recycled
+                    // to make sure nothing is copied, we're passing the underlying sharedArrayBuffer
+                    // not the nodejs wrapper Buffer
+                    msg.data.buffer = bufferPool.get().buffer;
+                    if (!msg.data.buffer) {
+                        throw new Error("bufferPool was empty");
+                    }
+                }
+                worker.postMessage(msg);
+            }
+        }
+
+        function checkReentrant() {
             // if already in this loop, ignore this call
             if (processingNow || keysToProcess.length === 0) {
                 // DEBUG("DEBUG_F2", `processKeys() re-entrancy blocked`);
@@ -644,10 +697,58 @@ async function generateRandomsWorkers() {
                     maxKeysToProcess = keysToProcess.length;
                     DEBUG("DEBUG_F2", `2: maxKeysToProcess increased to ${maxKeysToProcess}`);
                 }
+                return true;
+            }
+            return false;
+        }
+
+        async function processKeysBinary() {
+            // keysToProcess is an array of {buffer, cnt} objects containing binary keys
+            if (checkReentrant()) {
                 return;
             }
             ++processingNow;
-            let t2 = process.hrtime.bigint();
+            // keysToProcess is an array of {sharedArrayBuffer, cnt} that came from a workerThread
+            while (keysToProcess.length) {
+                const {sharedArrayBuffer, cnt} = keysToProcess.pop();
+                // put nodejs Buffer wrapper back on it (which just sets things on the prototype)
+                let buffer = Buffer.from(sharedArrayBuffer);
+                let index = 0;
+                for (let i = 0; i < cnt; i++) {
+                    // have to calculate the key here since all we have it the raw data
+                    let key = makeBucketKeyBinary(buffer, index);
+                    let ret = collection.addFromBuffer(key, buffer, index, keyLen);
+                    index += keyLen;
+                    // ret is an optional promise (for performance reasons)
+                    if (typeof ret.then === "function") {
+                        await ret;
+                    }
+                    ++randomsProcessed;
+                    if (randomsProcessed % progressMultiple === 0) {
+                        log(`Generating #${addCommas(randomsProcessed)}`);
+                    }
+                }
+                // put the buffer back in the pool so it can be used again
+                bufferPool.add(buffer);
+            }
+            if (randomsProcessed === numToTry) {
+                await collection.flush();
+                resolve();
+                return;
+            }
+            finish();
+            --processingNow;
+        }
+
+        // We serialize the adding of keys here because we were
+        // getting re-entrant problems while buckets were awaiting flush
+        // and new worker messages arrived and were being processed
+        // This way we serialize all the adding to buckets
+        async function processKeys() {
+            if (checkReentrant()) {
+                return;
+            }
+            ++processingNow;
             // note that during the await in this loop, new keys may be adding to keysToProcess
             while (keysToProcess.length) {
                 if (keysToProcess.length > maxKeysToProcess) {
@@ -658,13 +759,7 @@ async function generateRandomsWorkers() {
                 // more efficient to take one off the end rather than the beginning
                 // and it does not matter if we process keys in FIFO order
                 const [bucketKey, orderId] = keysToProcess.pop();
-                let ret;
-                if (doBinary) {
-                    // orderId is a UInt8Array, we want it to be a nodejs Buffer object
-                    ret = collection.add(bucketKey, Buffer.from(orderId.buffer));
-                } else {
-                    ret = collection.add(bucketKey, orderId);
-                }
+                let ret = collection.add(bucketKey, orderId);
                 // if this returns a promise, await it, otherwise it was synchronous
                 // for a run of 100,000,000, not awaiting when we don't have to is 30% faster
                 if (typeof ret.then === "function") {
@@ -676,33 +771,24 @@ async function generateRandomsWorkers() {
                 }
             }
             if (randomsProcessed === numToTry) {
-                let t2 = process.hrtime.bigint();
                 await collection.flush();
-                let t3 = process.hrtime.bigint();
-                bucketProcessTime += (t3 - t2);
-                DEBUG("DEBUG_F1", `totalGeneration = ${addCommas(t3 - t1)}, bucketInsertion = ${addCommas(bucketProcessTime)}`);
                 resolve();
                 return;
             }
-            let t3 = process.hrtime.bigint();
-            bucketProcessTime += (t3 - t2);
-
-            // we emptied our queue so tell all the paused workers, we're ready for more
-            for (let worker of pausedWorkers) {
-                worker.postMessage({event: "batch"});
-            }
-            pausedWorkers.length = 0;
+            finish();
             --processingNow;
         }
 
         for (let i = 0; i < numWorkers; i++) {
             let num = Math.min(randomsRemaining, randomsPerWorker);
             let worker = new Worker("./worker.js", {
-                workerData: {numToTry: num, numToBatch: numToBatch, workerId: i, doBinary: doBinary}
+                workerData: {numToTry: num, numToBatch: numToBatch, workerId: i, doBinary: doBinary, keyLen: keyLen}
             });
             workers.add(worker);
             randomsRemaining -= num;
 
+            let maxTransferTime = 0n;
+            let transferCum = 0n;
             worker.on('message', async (msg) => {
 
                 // Design note: these message handlers can be called
@@ -712,32 +798,45 @@ async function generateRandomsWorkers() {
                     pausedWorkers.push(worker);
 
                     let data = msg.data;
-                    // data is an array of arrays where the inner arrays are [bucketKey, orderId]
-                    // if doBinary is set, then orderId is a binary buffer, 16 btyes long
-                    //    otherwise, orderId is a base58 encoded string
-                    keysReceived += data.length;
-                    //console.log(`Incoming ${data.length} keys from WorkerId ${msg.workerId}, total keysReceived = ${keysReceived}`);
-                    //console.log(data);
-                    let t2 = process.hrtime.bigint();
-                    // add these new keys to the list of keys to be processed
-                    // we're pushing them one at a time to try to avoid a copy of the data
-                    for (let item of data) {
-                        keysToProcess.push(item);
+                    // for non-binary, data is an array of arrays where the inner arrays are [bucketKey, orderId]
+                    //    orderId is a base58 encoded string
+                    if (doBinary) {
+                        // if doBinary is set, then data.sharedArrayBuffer is a sharedArrayBuffer full of packed binary ids
+                        //    one after the other, keyLen bytes each
+                        //    data.cnt is the number of valid ids in the buffer
+                        keysReceived += data.cnt;
+                        // put the buffer and cnt into the queue
+                        keysToProcess.push(data);
+                    } else {
+                        keysReceived += data.length;
+                        for (let item of data) {
+                            keysToProcess.push(item);
+                        }
                     }
-                    let t3 = process.hrtime.bigint();
-                    bucketProcessTime += (t3 - t2);
 
-                    // kick of processing if it's not already going
-                    processKeys().catch(err => {
+                    // record how long it took for this data transfer
+                    let sendDelta = new Bench(msg.postMessageTime).markEnd().ns;
+                    transferCum += sendDelta;
+                    if (sendDelta > maxTransferTime) {
+                        maxTransferTime = sendDelta;
+                    }
+
+                    // kick off processing if it's not already going
+                    let processFn = doBinary ? processKeysBinary : processKeys;
+                    processFn().catch(err => {
                         log.now(err);
                         process.exit(1);
                     });
                 } else if (msg.event === "usage") {
                     let data = msg.data;
+                    let sendDelta = new Bench(msg.postMessageTime).markEnd();
                     log.now(`worker ${msg.workerId} finished`);
-                    log.now(`  busy percentage : ${data.busyPercentage.toFixed(1)}%`);
-                    log.now(`  measureBusy:      ${addCommas(data.measureBusy)} `);
-                    log.now(`  measureTotal:     ${addCommas(data.measureTotal)}`);
+                    log.now(`   busy percentage:   ${data.busyPercentage.toFixed(1)}%`);
+                    log.now(`   measureBusy:       ${Bench.formatNsToSec(data.measureBusy, 1)} sec`);
+                    log.now(`   measureTotal:      ${Bench.formatNsToSec(data.measureTotal, 1)} sec`);
+                    log.now(`   postMessageTime:   ${sendDelta.formatMs(1)}`);
+                    log.now(`   maxTransferTime:   ${Bench.formatNsToMs(maxTransferTime, 1)} ms`);
+                    log.now(`   totalTransferTime: ${Bench.formatNsToSec(transferCum, 3)} sec`);
                 }
 
             });
