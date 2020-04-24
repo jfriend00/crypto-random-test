@@ -67,7 +67,7 @@ class WorkerList {
     }
 }
 
-async function run() {
+async function analyzeWithWorkers() {
     log.now("Collecting files...")
     console.log(sourceDir);
     let files = (await fsp.readdir(sourceDir, {withFileTypes: true}))
@@ -256,7 +256,11 @@ async function run() {
     process.exit(0);
 }
 
-run().catch(err => {
-    console.log(err);
-    process.exit(1);
-});
+if (require.main === module) {
+    analyzeWithWorkers().catch(err => {
+        console.log(err);
+        process.exit(1);
+    });
+}
+
+module.exports = analyzeWithWorkers;
