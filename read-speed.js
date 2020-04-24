@@ -12,6 +12,9 @@ const { Bench } = require('../measure');
 
 const log = getLogger();
 
+// how long each binary key is
+const keyLen = 16;
+
 // command line arguments
 const spec = [
     "-numToRead=num", 0,
@@ -20,6 +23,7 @@ const spec = [
     "-skipParsing", false,
     "-preOpenFiles", false,
     "-dir=dir", "./buckets",
+    "-binary", false,
 ];
 
 // module level configuration variables from command line arguments (with defaults)
@@ -30,6 +34,7 @@ let {
     skipParsing,
     preOpenFiles,
     dir: sourceDir,
+    binary: doBinary,
 } = processArgs(spec);
 
 class WorkerList {
@@ -81,6 +86,7 @@ async function run() {
           return filename;
         }
     }));
+
     let start = Date.now();
     let totalBytes = 0;
 
@@ -169,7 +175,7 @@ async function run() {
     // startup the workers
     for (let i = 0; i < numWorkers; i++) {
         let worker = new Worker("./read-speed-worker.js", {
-            workerData: {workerId: i}
+            workerData: {workerId: i, doBinary, keyLen}
         });
         workers.add(worker);
         freeWorkers.add(worker);
