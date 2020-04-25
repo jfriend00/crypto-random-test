@@ -143,6 +143,10 @@ class Bucket {
 
         // for binary, we only have the "asyncHandle" strategy
         if (this.binary) {
+            // if nothing left in the buffer, then skip any more flush logic
+            if (!this.bufferPos) {
+                return;
+            }
             try {
                 ++this.flushCnt;
                 if (!this.fileHandle) {
@@ -159,11 +163,9 @@ class Bucket {
                 // reset back to start of our buffer for future add() calls
                 this.bufferPos = 0;
             } catch(e) {
-                if (this.fileHandle) {
-                    await this.fileHandle.close().catch(err => {
-                        log.now(err);
-                    });
-                }
+                await this.close().catch(err => {
+                    log.now(err);
+                });
                 throw e;
             } finally {
                 --this.flushCnt;
@@ -200,11 +202,9 @@ class Bucket {
                     }
                     this.filePos += data.length;
                 } catch(e) {
-                    if (this.fileHandle) {
-                        await this.fileHandle.close().catch(err => {
+                    await this.close().catch(err => {
                             log.now(err);
-                        });
-                    }
+                    });
                     throw e;
                 } finally {
                     --this.flushCnt;
@@ -282,13 +282,16 @@ class Bucket {
         return this.waitPromise;
     }
 
-    close() {
+    async close(withFlush = false) {
         if (this.fileHandle) {
+            if (withFlush) {
+                await this.flush().catch(err => {
+                    log.now(err);
+                });
+            }
             let fh = this.fileHandle;
             this.fileHandle = null;
             return fh.close();
-        } else {
-            return Promise.resolve();
         }
     }
 
@@ -353,6 +356,14 @@ class BucketCollection {
         for (let bucket of buckets) {
             await bucket.flush();
         }
+    }
+
+    close() {
+        let buckets = Array.from(this.buckets.values());
+        return Promise.allSettled(buckets.map(bucket => {
+            // close with flush
+            return bucket.close(true);
+        }));
     }
     async delete() {
         // delete all the files associated with the buckets
@@ -886,6 +897,9 @@ async function runIt() {
         if (!generateOnly) {
             log.now("Analyzing buckets...")
             if (doBinary) {
+                // binary analyzeWithWorkers() does not use open fileHandles,
+                // so we close the file handles here
+                await collection.close();
                 await analyzeWithWorkers({
                     binary: doBinary,
                     numWorkers: analyzeWorkers,
