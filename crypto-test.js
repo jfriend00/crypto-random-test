@@ -13,6 +13,7 @@ const { Bench } = require('../measure');
 const BufferPool = require('./buffer-pool.js');
 const processArgs = require('../cmd-line-args');
 const analyzeWithWorkers = require('./read-speed.js');
+const { promiseAllDone } = require('../async-utils');
 
 const keyLen = 16;
 
@@ -296,7 +297,6 @@ class Bucket {
     }
 
     delete() {
-        this.record("delete");
         return fsp.unlink(this.filename);
     }
 
@@ -353,23 +353,26 @@ class BucketCollection {
         // because of multi-tasking issues, we get a static list of buckets to flush
         // before we await any of them
         let buckets = Array.from(this.buckets.values());
+        let err;
         for (let bucket of buckets) {
-            await bucket.flush();
+            // flushes are purposely serialized here to avoid too many writes all at once
+            await bucket.flush().catch(e => {
+                if (!err) err = e;
+            });
         }
+        if (err) throw err;
     }
 
+    // completes all the close operations, but will tell you if it had an error
     close() {
         let buckets = Array.from(this.buckets.values());
-        return Promise.allSettled(buckets.map(bucket => {
-            // close with flush
-            return bucket.close(true);
-        }));
+        return promiseAllDone(buckets.map(bucket => bucket.close(true)));
     }
+    // completes all deletes, but will tell you if it had an error
     async delete() {
         // delete all the files associated with the buckets
-        for (let bucket of this.buckets.values()) {
-            await bucket.delete();
-        }
+        let buckets = Array.from(this.buckets.values());
+        return promiseAllDone(buckets.map(bucket => bucket.delete()));
     }
     get files() {
         let files = [];
@@ -895,11 +898,12 @@ async function runIt() {
         }
 
         if (!generateOnly) {
-            log.now("Analyzing buckets...")
             if (doBinary) {
                 // binary analyzeWithWorkers() does not use open fileHandles,
                 // so we close the file handles here
+                log.now("Closing files");
                 await collection.close();
+                log.now("Analyzing buckets...")
                 await analyzeWithWorkers({
                     binary: doBinary,
                     numWorkers: analyzeWorkers,
@@ -907,6 +911,7 @@ async function runIt() {
                     files: collection.files,       // files or file handlers from all buckets
                 });
             } else {
+                log.now("Analyzing buckets...")
                 await analyze();
             }
         }
@@ -917,6 +922,11 @@ async function runIt() {
             log.now("Cleaning up buckets...");
             await collection.delete();
         }
+    } catch(e) {
+        await collection.close().catch(err => {
+            log.now("Error closing files in finally handlers", err);
+        });
+        throw e;
     } finally {
         // make sure any pending logs get sent
         log.flush();
