@@ -15,28 +15,6 @@ const log = getLogger();
 // how long each binary key is
 const keyLen = 16;
 
-// command line arguments
-const spec = [
-    "-numToRead=num", 0,
-    "-numConcurrent=num", 4,
-    "-numWorkers=num", 5,
-    "-skipParsing", false,
-    "-preOpenFiles", false,
-    "-dir=dir", "./buckets",
-    "-binary", false,
-];
-
-// module level configuration variables from command line arguments (with defaults)
-let {
-    numToRead,
-    numConcurrent,
-    numWorkers,
-    skipParsing,
-    preOpenFiles,
-    dir: sourceDir,
-    binary: doBinary,
-} = processArgs(spec);
-
 class WorkerList {
     constructor() {
         this.workers = [];
@@ -67,25 +45,51 @@ class WorkerList {
     }
 }
 
-async function analyzeWithWorkers() {
-    log.now("Collecting files...")
-    console.log(sourceDir);
-    let files = (await fsp.readdir(sourceDir, {withFileTypes: true}))
-        .filter(entry => entry.isFile());
-    if (numToRead !== 0) {
-        files.length = numToRead;
-    }
-    files = await Promise.all(files.map(entry => {
-        let filename = path.resolve(path.join(sourceDir, entry.name));
-        if (preOpenFiles) {
-          return fsp.open(filename, "r").then(handle => {
-              handle.filename = filename;
-              return handle;
-          });
-        } else {
-          return filename;
+// command line arguments specification for processArgs()
+const commandLineSpec = [
+    "-numToRead=num", 0,
+    "-numConcurrent=num", 4,
+    "-numWorkers=num", 5,
+    "-skipParsing", false,
+    "-preOpenFiles", false,
+    "-dir=dir", "./buckets",
+    "-binary", false,
+];
+
+async function analyzeWithWorkers(options) {
+
+    // get our options and combine with default values
+    let {
+        numToRead = 0,
+        numConcurrent = 4,
+        numWorkers = 5,
+        skipParsing = false,
+        preOpenFiles = false,
+        dir: sourceDir = "./buckets",
+        binary: doBinary = false,
+        files = null,
+    } = options;
+
+
+    if (!files) {
+        log.now(`Collecting files from ${sourceDir}`);
+        files = (await fsp.readdir(sourceDir, {withFileTypes: true}))
+            .filter(entry => entry.isFile());
+        if (numToRead !== 0) {
+            files.length = numToRead;
         }
-    }));
+        files = await Promise.all(files.map(entry => {
+            let filename = path.resolve(path.join(sourceDir, entry.name));
+            if (preOpenFiles) {
+              return fsp.open(filename, "r").then(handle => {
+                  handle.filename = filename;
+                  return handle;
+              });
+            } else {
+              return filename;
+            }
+        }));
+    }
 
     let start = Date.now();
     let totalBytes = 0;
@@ -233,7 +237,10 @@ async function analyzeWithWorkers() {
 
     let delta = Date.now() - start;
     let deltaSeconds = delta / 1000;
-    log.now(`\nTotal time = ${addCommas(deltaSeconds)} seconds`);
+
+    log.now("---------------------------------\nNo conflicting ids found!\n");
+
+    log.now(`Total analyze time = ${addCommas(deltaSeconds)} seconds`);
     log.now(`  number of files:  ${numRead}`);
     log.now(`  numConcurrent:    ${numConcurrent}`);
     log.now(`  numWorkers:       ${numWorkers}`);
@@ -243,24 +250,28 @@ async function analyzeWithWorkers() {
     log.now(`  readFileTime:     ${readBench.formatSec(3)}`);
     log.now(`  longestWait:      ${longestWait} ms`);
     log.now(`  totalWait:        ${addCommas((Number(totalWait) / (1000 * 1000)).toFixed(0))} ms`);
-    log.now("\n");
-//    log.now(`  parseFileTime:    ${parseBench.formatSec(3)}`);
+    log.now("");
 
-    // close any open files
-    if (typeof files[0] !== "string") {
+    // stop all the workers so the process can execute normally
+    for (let worker of workers) {
+        await worker.terminate();
+    }
+
+    // if we pre-opened files and kept them open, then close them now
+    if (preOpenFiles) {
         for (let file of files) {
             await file.close();
         }
     }
-
-    process.exit(0);
 }
 
+// for running from the command line
 if (require.main === module) {
-    analyzeWithWorkers().catch(err => {
+    analyzeWithWorkers(processArgs(commandLineSpec)).catch(err => {
         console.log(err);
         process.exit(1);
     });
 }
 
+// for calling this from another module
 module.exports = analyzeWithWorkers;
