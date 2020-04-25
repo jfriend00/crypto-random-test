@@ -577,7 +577,7 @@ async function analyze() {
 
             await run();
         }
-        log.now("---------------------------------\nNo conflicting ids found!\n")
+        log.now("---------------------------------\nNo conflicting ids found!\n");
     } finally {
         log.flush();
     }
@@ -896,7 +896,9 @@ async function runIt() {
                 await analyze();
             }
         }
-        log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`);
+        let runTime = Date.now() - start;
+        log.now(`Total run time = ${addCommas((runTime)/1000)} sec`);
+        log.now(`                 ${addCommas((runTime/(1000 * 60)).toFixed(2))} mins`);
         if (!preserveFiles && writeToDisk) {
             log.now("Cleaning up buckets...");
             await collection.delete();
