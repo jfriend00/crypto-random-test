@@ -12,6 +12,7 @@ const { getLogger } = require('../delay-logger');
 const { Bench } = require('../measure');
 const BufferPool = require('./buffer-pool.js');
 const processArgs = require('../cmd-line-args');
+const analyzeWithWorkers = require('./read-speed.js');
 
 const keyLen = 16;
 
@@ -359,6 +360,13 @@ class BucketCollection {
             await bucket.delete();
         }
     }
+    get files() {
+        let files = [];
+        for (let bucket of this.buckets.values()) {
+            files.push(bucket.filename);
+        }
+        return files;
+    }
     get size() {
         return this.buckets.size;
     }
@@ -375,13 +383,15 @@ class BucketCollection {
 const spec = [
     "-binary", false,
     "-generateWorkers=num", 6,
+    "-analyzeWorkers=num", 5,
     "-generateOnly", false,
     "-analyzeOnly", false,
     "-dirs=[dir]", [],
     "-numToBatch=num", 2000,
     "-preserveFiles", false,
     "-nodisk", false,
-    "-analyzeParallel", 4
+    "-analyzeParallel", 4,
+    "-help", false,
 ];
 
 // module level configuration variables from command line arguments (with defaults)
@@ -396,7 +406,24 @@ let {
     unnamed,
     nodisk,
     analyzeParallel,
+    analyzeWorkers,
+    help,
 } = processArgs(spec);
+
+if (help) {
+    console.log(`\nUsage: node crypto-test.js num [-options]
+    -binary
+    -generateOnly
+    -generateWorkers=6
+    -analyzeOnly
+    -analyzeWorkers=5
+    -analyzeParallel=4
+    -numtoBatch=2000
+    -preserveFiles
+    -nodisk
+    -dirs="/foo;/fee"`);
+    process.exit(0);
+}
 
 let numToTry = 100_000;
 let collection;
@@ -858,7 +885,16 @@ async function runIt() {
 
         if (!generateOnly) {
             log.now("Analyzing buckets...")
-            await analyze();
+            if (doBinary) {
+                await analyzeWithWorkers({
+                    binary: doBinary,
+                    numWorkers: analyzeWorkers,
+                    numConcurrent: analyzeParallel,
+                    files: collection.files,       // files or file handlers from all buckets
+                });
+            } else {
+                await analyze();
+            }
         }
         log.now(`Total run time = ${addCommas((Date.now() - start)/1000)}`);
         if (!preserveFiles && writeToDisk) {
@@ -874,4 +910,5 @@ async function runIt() {
 
 runIt().catch(err => {
     log.now(err);
+    process.exit(1);
 });
