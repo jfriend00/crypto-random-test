@@ -1,8 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const fs = require('fs');
-const fsp = fs.promises;
+const {fs, fsp, fsc} = require('../fs-common');
 const path = require('path');
 const {fastReadFileLines} = require('./fast-read-file.js');
 const {makeBucketKey, makeBucketKeyBinary} = require('./bucketkey.js');
@@ -152,13 +151,10 @@ class Bucket {
                 ++this.flushCnt;
                 if (!this.fileHandle) {
                     // create new file, open for reading and writing, truncate if exists
-                    this.fileHandle = await fsp.open(this.filename, "w+");
+                    this.fileHandle = await fsc.open(this.filename, "w+");
                 }
                 // write out the buffer, straight to the file
-                const { bytesWritten } = await this.fileHandle.write(this.buffer, 0, this.bufferPos, this.filePos);
-                if (bytesWritten !== this.bufferPos) {
-                    throw new Error(`All data not written to file ${this.filename}, specified ${this.bufferPos}, only ${bytesWritten} bytes written`);
-                }
+                await this.fileHandle.writeBufferCheck(this.buffer, 0, this.bufferPos, this.filePos);
                 // advance file position to write
                 this.filePos += this.bufferPos;
                 // reset back to start of our buffer for future add() calls
