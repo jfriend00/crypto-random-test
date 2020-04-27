@@ -1,8 +1,7 @@
 "use strict";
 const processArgs = require("../cmd-line-args");
 const { fastReadFile,  fastReadFileLines, parseBufferIntoLines } = require('./fast-read-file.js');
-const fs = require('fs');
-const fsp = fs.promises;
+const {fs, fsp, fsc} = require('../fs-common');
 const path = require('path');
 const { addCommas } = require('../str-utils');
 const { getLogger } = require('../delay-logger');
@@ -73,22 +72,18 @@ async function analyzeWithWorkers(options) {
 
     if (!files) {
         log.now(`Collecting files from ${sourceDir}`);
-        files = (await fsp.readdir(sourceDir, {withFileTypes: true}))
-            .filter(entry => entry.isFile());
+        files = await fsc.listDirectory(sourceDir, {type: "files"});
         if (numToRead !== 0) {
             files.length = numToRead;
         }
-        files = await Promise.all(files.map(entry => {
-            let filename = path.resolve(path.join(sourceDir, entry.name));
-            if (preOpenFiles) {
-              return fsp.open(filename, "r").then(handle => {
+        if (preOpenFiles) {
+            files = await Promise.all(files.map(filename => {
+              return fsc.open(filename, "r").then(handle => {
                   handle.filename = filename;
                   return handle;
               });
-            } else {
-              return filename;
-            }
-        }));
+            }));
+        }
     }
 
     let start = Date.now();
