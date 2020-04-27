@@ -1,8 +1,7 @@
 "use strict";
 const processArgs = require("../cmd-line-args");
 const { fastReadFile,  fastReadFileLines, parseBufferIntoLines } = require('./fast-read-file.js');
-const {fs, fsp, fsc} = require('../fs-common');
-const path = require('path');
+const {fs, fsp, fsc, path} = require('../fs-common');
 const { addCommas } = require('../str-utils');
 const { getLogger } = require('../delay-logger');
 const { mapConcurrent, Deferred } = require('../async-utils');

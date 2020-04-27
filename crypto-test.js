@@ -1,8 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const {fs, fsp, fsc} = require('../fs-common');
-const path = require('path');
+const {fs, fsp, fsc, path} = require('../fs-common');
 const {fastReadFileLines} = require('./fast-read-file.js');
 const {makeBucketKey, makeBucketKeyBinary} = require('./bucketkey.js');
 const { addCommas } = require('../str-utils');
