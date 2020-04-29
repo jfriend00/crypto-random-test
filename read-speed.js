@@ -71,7 +71,7 @@ async function analyzeWithWorkers(options) {
 
     if (!files) {
         log.now(`Collecting files from ${sourceDir}`);
-        files = await fsc.listDirectory(sourceDir, {type: "files"});
+        files = await fsc.listDirectory(sourceDir, {types: "files"});
         if (numToRead !== 0) {
             files.length = numToRead;
         }
