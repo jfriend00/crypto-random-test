@@ -863,16 +863,11 @@ async function preflight() {
     if (dirs.length === 0) {
         dirs.push(__dirname);
     }
+    // make sure all the directories exist
     for (let [i, dir] of dirs.entries()) {
         let d = path.join(dir, "buckets");
         dirs[i] = d;
-        try {
-            fs.mkdirSync(d);
-        } catch(e) {
-            if (e.code !== 'EEXIST') {
-                throw e;
-            }
-        }
+        fsc.ensureDirectorySync(d);
     }
     collection = new BucketCollection(dirs, writeToDisk, doBinary);
 }
