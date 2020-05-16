@@ -11,18 +11,12 @@ const { Bench } = require('../measure');
 const BufferPool = require('./buffer-pool.js');
 const processArgs = require('../cmd-line-args');
 const analyzeWithWorkers = require('./read-speed.js');
-const { promiseAllDone } = require('../async-utils');
+const { allDone, delay } = require('../async-utils');
 
 const keyLen = 16;
 
 // create base58 encoder that uses only alpha numerics and leaves out O and 0 which get confused
 const base58Encode = require('base-x')('123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz').encode;
-
-function delay(t, v) {
-    return new Promise(resolve => {
-        setTimeout(resolve, t, v);
-    })
-}
 
 const log = getLogger();
 
@@ -361,13 +355,13 @@ class BucketCollection {
     // completes all the close operations, but will tell you if it had an error
     close() {
         let buckets = Array.from(this.buckets.values());
-        return promiseAllDone(buckets.map(bucket => bucket.close(true)));
+        return allDone(buckets.map(bucket => bucket.close(true)));
     }
     // completes all deletes, but will tell you if it had an error
     async delete() {
         // delete all the files associated with the buckets
         let buckets = Array.from(this.buckets.values());
-        return promiseAllDone(buckets.map(bucket => bucket.delete()));
+        return allDone(buckets.map(bucket => bucket.delete()));
     }
     get files() {
         let files = [];
