@@ -17,6 +17,6 @@
   },
   "homepage": "https://github.com/jfriend00/crypto-random-test#readme",
   "dependencies": {
-    "base-x": "^3.0.8"
+    "base-x": "^3.0.11"
   }
 }
